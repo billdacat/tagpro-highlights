@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Generated output (clips, audio, frame-data, overlays, summary videos)
+output/
+
+# Generated highlight manifests (regenerate from a replay via src/index.js)
+highlight-manifest.json
+
+# Personal/sample replay files dropped in the repo root
+*.ndjson
+*.mov
+*.mp4
+*.webm
+
+# OS cruft
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>TagPro Clip Renderer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; width: 1280px; height: 720px; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1280" height="720"></canvas>
+<script>
+// ── Coordinate system (from TagPro API docs) ─────────────────────────────
+// tagpro.TILE_SIZE = 40
+// rx = x / 100  →  game pixel x = rx * 100
+// center of player ball = x + 20, y + 20  (ball bounding box is 40×40)
+// Tile at (col, row) lives at game pixel (col*40, row*40)
+// frame data pre-adds +20 so p.x/p.y are already ball centres.
+
+const W = 1280, H = 720;
+const TILE_PX = 40;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let frameData = null;
+let tileCache = null;
+let mapCols = 27, mapRows = 37;
+let mapW = 1080, mapH = 1480;
+let OX = 100;   // (1280-1080)/2 — map centred horizontally in widescreen
+
+let cameraY = 0;  // vertical scroll (map is taller than canvas)
+let frameIdx = 0;
+let timerId = null;
+
+// ── Init ─────────────────────────────────────────────────────────────────
+async function init() {
+  const params = new URLSearchParams(location.search);
+  const dataUrl = params.get('data');
+  if (!dataUrl) { document.body.style.background = '#f00'; return; }
+
+  const res = await fetch(dataUrl);
+  frameData = await res.json();
+
+  mapCols = frameData.map.w;
+  mapRows = frameData.map.h;
+  mapW    = mapCols * TILE_PX;
+  mapH    = mapRows * TILE_PX;
+  OX      = Math.round((W - mapW) / 2);
+
+  tileCache = buildTileCache(frameData.map.tiles);
+
+  // setInterval gives deterministic 30fps — avoids RAF timer collapse in headless Chromium
+  timerId = setInterval(step, 1000 / 30);
+}
+
+// ── Animation step ────────────────────────────────────────────────────────
+function step() {
+  if (!frameData) return;
+  const frame = frameData.frames[frameIdx];
+
+  cameraY = computeCameraY(frame.pl);
+  drawFrame(frame);
+
+  if (frameIdx < frameData.frames.length - 1) {
+    frameIdx++;
+  } else {
+    clearInterval(timerId);
+    document.title = 'DONE';
+  }
+}
+
+// Camera scrolls so average alive-player Y stays vertically centred
+function computeCameraY(players) {
+  const alive = players.filter(p =>
+    !p.dead && p.x > 20 && p.x < mapW - 20 && p.y > 20 && p.y < mapH - 20
+  );
+  if (!alive.length) return cameraY;
+  const avgY = alive.reduce((s, p) => s + p.y, 0) / alive.length;
+  const target = Math.round(H / 2 - avgY);
+  return Math.max(-(mapH - H), Math.min(0, target));
+}
+
+// ── Tile cache (pre-rendered static map) ─────────────────────────────────
+function buildTileCache(tiles) {
+  const rows = tiles.length, cols = tiles[0].length;
+  const oc = document.createElement('canvas');
+  oc.width  = cols * TILE_PX;
+  oc.height = rows * TILE_PX;
+  const c = oc.getContext('2d');
+
+  c.fillStyle = '#000';
+  c.fillRect(0, 0, oc.width, oc.height);
+
+  for (let r = 0; r < rows; r++) {
+    for (let col = 0; col < cols; col++) {
+      const raw = tiles[r][col];
+      if (raw === 0) continue;
+      drawTile(c, col * TILE_PX, r * TILE_PX, raw);
+    }
+  }
+  return oc;
+}
+
+function drawTile(c, x, y, raw) {
+  const base = Math.floor(raw);
+
+  // Floor background for every non-void tile
+  c.fillStyle = '#1a2a18';
+  c.fillRect(x, y, TILE_PX, TILE_PX);
+
+  switch (base) {
+    case 2: break; // pure floor — background already drawn
+
+    case 1: {
+      // Wall: full square or diagonal (API: 1.1=◣ 1.2=◤ 1.3=◥ 1.4=◢)
+      // First decimal digit = orientation; further digits = marching-squares index
+      const orient = Math.round(((raw % 1) * 10) % 10);
+      c.fillStyle = '#686868';
+      c.beginPath();
+      if      (orient === 1) { c.moveTo(x, y); c.lineTo(x, y+TILE_PX); c.lineTo(x+TILE_PX, y+TILE_PX); }
+      else if (orient === 2) { c.moveTo(x, y); c.lineTo(x+TILE_PX, y); c.lineTo(x, y+TILE_PX); }
+      else if (orient === 3) { c.moveTo(x, y); c.lineTo(x+TILE_PX, y); c.lineTo(x+TILE_PX, y+TILE_PX); }
+      else if (orient === 4) { c.moveTo(x+TILE_PX, y); c.lineTo(x, y+TILE_PX); c.lineTo(x+TILE_PX, y+TILE_PX); }
+      else                   { c.rect(x, y, TILE_PX, TILE_PX); }
+      c.closePath(); c.fill();
+      c.strokeStyle = 'rgba(0,0,0,0.4)';
+      c.lineWidth = 1;
+      c.stroke();
+      break;
+    }
+
+    case 3:
+    case 4: { // red/blue flag base
+      const isRed = base === 3;
+      c.fillStyle = isRed ? 'rgba(180,30,30,0.35)' : 'rgba(30,60,180,0.35)';
+      c.fillRect(x, y, TILE_PX, TILE_PX);
+      c.fillStyle = '#ccc';
+      c.fillRect(x + 10, y + 7, 3, 24);          // pole
+      c.fillStyle = isRed ? '#ff3333' : '#3366ff';
+      c.fillRect(x + 13, y + 7, 14, 10);          // flag cloth
+      break;
+    }
+
+    case 5: { // speedpad (5=active 5.1=inactive)
+      const active = raw < 5.05;
+      c.fillStyle = active ? '#ddcc00' : '#4a4a1a';
+      c.fillRect(x + 4, y + 13, TILE_PX - 8, TILE_PX - 26);
+      if (active) { c.fillStyle = '#ffee66'; c.fillRect(x + 8, y + 16, TILE_PX - 16, 3); }
+      break;
+    }
+
+    case 6: { // powerup subgroup (6.1=jukejuice 6.2=rollingbomb 6.3=tagpro 6.4=topspeed)
+      const sub = Math.round(((raw - 6) * 10)) % 10;
+      const clrs = { 1:'#bb00ee', 2:'#ff6600', 3:'#00cc55', 4:'#cc0044' };
+      c.fillStyle = clrs[sub] ?? '#9900cc';
+      c.beginPath(); c.arc(x + TILE_PX/2, y + TILE_PX/2, 13, 0, Math.PI*2); c.fill();
+      c.strokeStyle = 'rgba(255,255,255,0.5)'; c.lineWidth = 2; c.stroke();
+      break;
+    }
+
+    case 7: { // spike
+      c.fillStyle = '#999';
+      c.beginPath();
+      c.moveTo(x + TILE_PX/2, y + 5);
+      c.lineTo(x + TILE_PX - 5, y + TILE_PX - 5);
+      c.lineTo(x + 5, y + TILE_PX - 5);
+      c.closePath(); c.fill();
+      break;
+    }
+
+    case 8: { // button
+      c.fillStyle = '#996600';
+      c.beginPath(); c.arc(x + TILE_PX/2, y + TILE_PX/2, 12, 0, Math.PI*2); c.fill();
+      c.fillStyle = '#ffaa00';
+      c.beginPath(); c.arc(x + TILE_PX/2, y + TILE_PX/2, 7, 0, Math.PI*2); c.fill();
+      break;
+    }
+
+    case 9: { // gate: 9=inactive 9.1=green 9.2=red 9.3=blue
+      const sub9 = raw - 9;
+      const gc = sub9 < 0.05 ? '#888' : sub9 < 0.15 ? '#33cc55' : sub9 < 0.25 ? '#ff3333' : '#3366ff';
+      c.fillStyle = gc;
+      c.fillRect(x + 6, y, TILE_PX - 12, TILE_PX);
+      break;
+    }
+
+    case 10: { // bomb: 10=active 10.1=inactive
+      const active = raw < 10.05;
+      c.fillStyle = active ? '#ff5500' : '#555';
+      c.beginPath(); c.arc(x + TILE_PX/2, y + TILE_PX/2, 13, 0, Math.PI*2); c.fill();
+      if (active) {
+        c.fillStyle = '#ffaa44';
+        c.beginPath(); c.arc(x + TILE_PX/2, y + TILE_PX/2, 7, 0, Math.PI*2); c.fill();
+      }
+      break;
+    }
+
+    case 11: { c.fillStyle = 'rgba(170,35,35,0.45)'; c.fillRect(x, y, TILE_PX, TILE_PX); break; } // red teamtile
+    case 12: { c.fillStyle = 'rgba(35,65,170,0.45)'; c.fillRect(x, y, TILE_PX, TILE_PX); break; } // blue teamtile
+  }
+}
+
+// ── Per-frame rendering ───────────────────────────────────────────────────
+function drawFrame(frame) {
+  const OY = cameraY;
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  if (tileCache) ctx.drawImage(tileCache, OX, OY);
+
+  for (const p of frame.pl) {
+    if (p.dead) continue;
+    // Filter positions outside valid map bounds (players can briefly go OOB)
+    if (p.x < 20 || p.x > mapW - 20 || p.y < 20 || p.y > mapH - 20) continue;
+
+    const sx = OX + p.x;
+    const sy = OY + p.y;
+    if (sx < -30 || sx > W + 30 || sy < -30 || sy > H + 30) continue;
+
+    const R = 19;
+
+    // Drop shadow
+    ctx.beginPath(); ctx.arc(sx + 2, sy + 3, R, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fill();
+
+    // Ball
+    ctx.beginPath(); ctx.arc(sx, sy, R, 0, Math.PI * 2);
+    ctx.fillStyle = p.team === 1 ? '#dd2222' : '#2244dd';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.75)'; ctx.lineWidth = 2; ctx.stroke();
+
+    // Specular shine
+    ctx.beginPath(); ctx.arc(sx - 5, sy - 6, 7, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.22)'; ctx.fill();
+
+    // Flag dot
+    if (p.flag) {
+      const fc = p.flag === 1 ? '#ff4444' : '#4466ff';
+      ctx.beginPath(); ctx.arc(sx, sy - R - 9, 7, 0, Math.PI * 2);
+      ctx.fillStyle = fc; ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+
+    // Name tag
+    ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillText(p.name, sx + 1, sy + R + 15);
+    ctx.fillStyle = '#eee';            ctx.fillText(p.name, sx,     sy + R + 14);
+  }
+
+  drawHUD(frame);
+}
+
+function drawHUD(frame) {
+  const [rs, bs] = frame.sc;
+  const BAR = 40;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.82)';
+  ctx.fillRect(0, 0, W, BAR);
+
+  ctx.font = 'bold 26px monospace'; ctx.textAlign = 'left';
+  ctx.fillStyle = '#ff4444'; ctx.fillText(String(rs), 20, BAR - 8);
+  ctx.fillStyle = '#4466ff'; ctx.textAlign = 'right'; ctx.fillText(String(bs), W - 20, BAR - 8);
+
+  ctx.font = 'bold 12px monospace'; ctx.fillStyle = '#bbb'; ctx.textAlign = 'center';
+  ctx.fillText('ASIDA', W / 2, 15);
+
+  const mm = Math.floor(frame.t / 60000);
+  const ss = String(Math.floor((frame.t % 60000) / 1000)).padStart(2, '0');
+  ctx.font = 'bold 18px monospace'; ctx.fillStyle = '#ddd';
+  ctx.fillText(`${mm}:${ss}`, W / 2, BAR - 7);
+
+  if (frame.cap) {
+    const CAP = 40;
+    ctx.fillStyle = 'rgba(0,0,0,0.85)';
+    ctx.fillRect(0, H - CAP, W, CAP);
+    ctx.font = 'bold 20px monospace'; ctx.fillStyle = '#ffe066'; ctx.textAlign = 'center';
+    ctx.fillText(frame.cap, W / 2, H - 11);
+  }
+}
+
+init();
+</script>
+</body>
+</html>

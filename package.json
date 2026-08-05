@@ -1,0 +1,12 @@
+{
+  "name": "tagpro-highlights",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "playwright": "^1.61.0"
+  }
+}

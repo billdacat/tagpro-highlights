@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>TagPro VGS Demo</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; width: 1280px; height: 720px; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1280" height="720"></canvas>
+<script>
+// ── VGS menu tree ─────────────────────────────────────────────────────────
+const VGS_TREE = {
+  label: 'VGS',
+  children: {
+    A: { label: 'Attack', children: {
+      A: { label: 'Get the flag!',             phrase: 'Get the flag!' },
+      B: { label: 'I need backup!',            phrase: 'I need backup!' },
+      F: { label: 'I am attacking the flag!',  phrase: 'I am attacking the flag!' },
+      G: { label: 'Incoming!',                 phrase: 'Incoming!' },
+      R: { label: 'Retrieve our flag!',        phrase: 'Retrieve our flag!' },
+      S: { label: 'I got the flag!',           phrase: 'I got the flag!' },
+    }},
+    D: { label: 'Defend', children: {
+      B: { label: 'Defend the base!',     phrase: 'Defend the base!' },
+      F: { label: 'Defend the flag!',     phrase: 'Defend the flag!' },
+      G: { label: 'Cover me!',            phrase: 'Cover me!' },
+      R: { label: 'Return to base!',      phrase: 'Return to base!' },
+    }},
+    G: { label: 'Global', children: {
+      G: { label: 'Good game!',   phrase: 'Good game!' },
+      N: { label: 'Nice one!',    phrase: 'Nice one!' },
+      S: { label: 'Sorry!',       phrase: 'Sorry!' },
+    }},
+    S: { label: 'Self', children: {
+      C: { label: 'On my way!',    phrase: 'On my way!' },
+      F: { label: 'Taking the flag!', phrase: 'Taking the flag!' },
+      R: { label: 'Returning flag!',  phrase: 'Returning flag!' },
+    }},
+    T: { label: 'Taunt', children: {
+      A: { label: 'Anytime.',     phrase: 'Anytime.' },
+      B: { label: 'Bring it!',    phrase: 'Bring it!' },
+      C: { label: 'Cha-ching!',   phrase: 'Cha-ching!' },
+    }},
+  },
+};
+
+// ── Coordinate system ─────────────────────────────────────────────────────
+const W = 1280, H = 720;
+const TILE_PX = 40;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let frameData = null;
+let vgsConfig  = null; // { triggerMs, sequence, phrase, playerName, team }
+let tileCache  = null;
+let mapCols = 27, mapRows = 37, mapW = 1080, mapH = 1480, OX = 100;
+let cameraY = 0, frameIdx = 0, timerId = null;
+
+// ── Init ──────────────────────────────────────────────────────────────────
+async function init() {
+  const params  = new URLSearchParams(location.search);
+  const dataUrl = params.get('data');
+  const vgsRaw  = params.get('vgs');
+  if (!dataUrl) { document.body.style.background = '#f00'; return; }
+
+  vgsConfig = vgsRaw ? JSON.parse(decodeURIComponent(vgsRaw)) : null;
+
+  const res = await fetch(dataUrl);
+  frameData = await res.json();
+
+  mapCols = frameData.map.w;
+  mapRows = frameData.map.h;
+  mapW    = mapCols * TILE_PX;
+  mapH    = mapRows * TILE_PX;
+  OX      = Math.round((W - mapW) / 2);
+
+  tileCache = buildTileCache(frameData.map.tiles);
+  timerId   = setInterval(step, 1000 / 30);
+}
+
+function step() {
+  if (!frameData) return;
+  const frame = frameData.frames[frameIdx];
+  cameraY = computeCameraY(frame.pl);
+  drawFrame(frame);
+  if (frameIdx < frameData.frames.length - 1) {
+    frameIdx++;
+  } else {
+    clearInterval(timerId);
+    document.title = 'DONE';
+  }
+}
+
+function computeCameraY(players) {
+  const alive = players.filter(p =>
+    !p.dead && p.x > 20 && p.x < mapW - 20 && p.y > 20 && p.y < mapH - 20
+  );
+  if (!alive.length) return cameraY;
+  const avgY = alive.reduce((s, p) => s + p.y, 0) / alive.length;
+  const target = Math.round(H / 2 - avgY);
+  return Math.max(-(mapH - H), Math.min(0, target));
+}
+
+// ── Tile cache ────────────────────────────────────────────────────────────
+function buildTileCache(tiles) {
+  const rows = tiles.length, cols = tiles[0].length;
+  const oc = document.createElement('canvas');
+  oc.width = cols * TILE_PX; oc.height = rows * TILE_PX;
+  const c = oc.getContext('2d');
+  c.fillStyle = '#000'; c.fillRect(0, 0, oc.width, oc.height);
+  for (let r = 0; r < rows; r++)
+    for (let col = 0; col < cols; col++) {
+      const raw = tiles[r][col];
+      if (raw !== 0) drawTile(c, col * TILE_PX, r * TILE_PX, raw);
+    }
+  return oc;
+}
+
+function drawTile(c, x, y, raw) {
+  const base = Math.floor(raw);
+  c.fillStyle = '#1a2a18'; c.fillRect(x, y, TILE_PX, TILE_PX);
+  switch (base) {
+    case 2: break;
+    case 1: {
+      const orient = Math.round(((raw % 1) * 10) % 10);
+      c.fillStyle = '#686868'; c.beginPath();
+      if      (orient===1){c.moveTo(x,y);c.lineTo(x,y+TILE_PX);c.lineTo(x+TILE_PX,y+TILE_PX);}
+      else if (orient===2){c.moveTo(x,y);c.lineTo(x+TILE_PX,y);c.lineTo(x,y+TILE_PX);}
+      else if (orient===3){c.moveTo(x,y);c.lineTo(x+TILE_PX,y);c.lineTo(x+TILE_PX,y+TILE_PX);}
+      else if (orient===4){c.moveTo(x+TILE_PX,y);c.lineTo(x,y+TILE_PX);c.lineTo(x+TILE_PX,y+TILE_PX);}
+      else               {c.rect(x,y,TILE_PX,TILE_PX);}
+      c.closePath(); c.fill();
+      c.strokeStyle='rgba(0,0,0,0.4)'; c.lineWidth=1; c.stroke();
+      break;
+    }
+    case 3: case 4: {
+      const isRed = base===3;
+      c.fillStyle = isRed?'rgba(180,30,30,0.35)':'rgba(30,60,180,0.35)'; c.fillRect(x,y,TILE_PX,TILE_PX);
+      c.fillStyle='#ccc'; c.fillRect(x+10,y+7,3,24);
+      c.fillStyle=isRed?'#ff3333':'#3366ff'; c.fillRect(x+13,y+7,14,10);
+      break;
+    }
+    case 5: { const a=raw<5.05; c.fillStyle=a?'#ddcc00':'#4a4a1a'; c.fillRect(x+4,y+13,TILE_PX-8,TILE_PX-26); if(a){c.fillStyle='#ffee66';c.fillRect(x+8,y+16,TILE_PX-16,3);} break; }
+    case 6: { const s=Math.round(((raw-6)*10))%10; const cl={1:'#bb00ee',2:'#ff6600',3:'#00cc55',4:'#cc0044'}; c.fillStyle=cl[s]??'#9900cc'; c.beginPath();c.arc(x+TILE_PX/2,y+TILE_PX/2,13,0,Math.PI*2);c.fill(); c.strokeStyle='rgba(255,255,255,0.5)';c.lineWidth=2;c.stroke(); break; }
+    case 7: { c.fillStyle='#999'; c.beginPath();c.moveTo(x+TILE_PX/2,y+5);c.lineTo(x+TILE_PX-5,y+TILE_PX-5);c.lineTo(x+5,y+TILE_PX-5);c.closePath();c.fill(); break; }
+    case 8: { c.fillStyle='#996600';c.beginPath();c.arc(x+TILE_PX/2,y+TILE_PX/2,12,0,Math.PI*2);c.fill(); c.fillStyle='#ffaa00';c.beginPath();c.arc(x+TILE_PX/2,y+TILE_PX/2,7,0,Math.PI*2);c.fill(); break; }
+    case 9: { const s9=raw-9; const gc=s9<0.05?'#888':s9<0.15?'#33cc55':s9<0.25?'#ff3333':'#3366ff'; c.fillStyle=gc; c.fillRect(x+6,y,TILE_PX-12,TILE_PX); break; }
+    case 10: { const a=raw<10.05; c.fillStyle=a?'#ff5500':'#555'; c.beginPath();c.arc(x+TILE_PX/2,y+TILE_PX/2,13,0,Math.PI*2);c.fill(); if(a){c.fillStyle='#ffaa44';c.beginPath();c.arc(x+TILE_PX/2,y+TILE_PX/2,7,0,Math.PI*2);c.fill();} break; }
+    case 11: { c.fillStyle='rgba(170,35,35,0.45)'; c.fillRect(x,y,TILE_PX,TILE_PX); break; }
+    case 12: { c.fillStyle='rgba(35,65,170,0.45)'; c.fillRect(x,y,TILE_PX,TILE_PX); break; }
+  }
+}
+
+// ── Main draw ─────────────────────────────────────────────────────────────
+function drawFrame(frame) {
+  const OY = cameraY;
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  if (tileCache) ctx.drawImage(tileCache, OX, OY);
+
+  for (const p of frame.pl) {
+    if (p.dead) continue;
+    if (p.x < 20 || p.x > mapW - 20 || p.y < 20 || p.y > mapH - 20) continue;
+    const sx = OX + p.x, sy = OY + p.y;
+    if (sx < -30 || sx > W+30 || sy < -30 || sy > H+30) continue;
+    const R = 19;
+    ctx.beginPath(); ctx.arc(sx+2, sy+3, R, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(sx, sy, R, 0, Math.PI*2);
+    ctx.fillStyle = p.team===1 ? '#dd2222' : '#2244dd'; ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.75)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(sx-5, sy-6, 7, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,0.22)'; ctx.fill();
+    if (p.flag) {
+      const fc = p.flag===1 ? '#ff4444' : '#4466ff';
+      ctx.beginPath(); ctx.arc(sx, sy-R-9, 7, 0, Math.PI*2);
+      ctx.fillStyle = fc; ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+    }
+    ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillText(p.name, sx+1, sy+R+15);
+    ctx.fillStyle = '#eee';            ctx.fillText(p.name, sx,   sy+R+14);
+  }
+
+  drawHUD(frame);
+  if (vgsConfig) drawVGS(frame.t);
+}
+
+// ── HUD ───────────────────────────────────────────────────────────────────
+function drawHUD(frame) {
+  const [rs, bs] = frame.sc;
+  const BAR = 40;
+  ctx.fillStyle = 'rgba(0,0,0,0.82)'; ctx.fillRect(0, 0, W, BAR);
+  ctx.font = 'bold 26px monospace'; ctx.textAlign = 'left';
+  ctx.fillStyle = '#ff4444'; ctx.fillText(String(rs), 20, BAR-8);
+  ctx.fillStyle = '#4466ff'; ctx.textAlign = 'right'; ctx.fillText(String(bs), W-20, BAR-8);
+  ctx.font = 'bold 12px monospace'; ctx.fillStyle = '#bbb'; ctx.textAlign = 'center';
+  ctx.fillText('ASIDA', W/2, 15);
+  const mm = Math.floor(frame.t/60000);
+  const ss = String(Math.floor((frame.t%60000)/1000)).padStart(2,'0');
+  ctx.font = 'bold 18px monospace'; ctx.fillStyle = '#ddd';
+  ctx.fillText(`${mm}:${ss}`, W/2, BAR-7);
+  if (frame.cap) {
+    ctx.fillStyle = 'rgba(0,0,0,0.85)'; ctx.fillRect(0, H-40, W, 40);
+    ctx.font = 'bold 20px monospace'; ctx.fillStyle = '#ffe066'; ctx.textAlign = 'center';
+    ctx.fillText(frame.cap, W/2, H-11);
+  }
+}
+
+// ── VGS overlay ───────────────────────────────────────────────────────────
+// Phases (relative to triggerMs):
+//   0–300ms   : V pressed  — level-0 menu fades in
+//   300–600ms : A pressed  — level-1 Attack menu shown
+//   600–900ms : F pressed  — menu fades out, chat appears
+//   900–3900ms: chat visible
+//   3900ms+   : nothing
+
+function drawVGS(frameT) {
+  const { triggerMs, sequence, phrase, playerName, team } = vgsConfig;
+  const rel = frameT - triggerMs;
+  if (rel < 0 || rel > 3900) return;
+
+  const teamClr = team === 1 ? '#ff4444' : '#4466ff';
+
+  if (rel < 900) {
+    // Determine which phase and menu to show
+    const phase = rel < 300 ? 0 : rel < 600 ? 1 : 2;
+    drawVGSMenu(phase, sequence, teamClr);
+  }
+
+  // Chat message: appears at rel=600, fades out after rel=3600
+  if (rel >= 600) {
+    const chatAlpha = rel > 3600 ? Math.max(0, 1 - (rel - 3600) / 300) : 1.0;
+    drawVGSChat(playerName, phrase, teamClr, chatAlpha);
+  }
+}
+
+function drawVGSMenu(phase, sequence, teamClr) {
+  // phase 0 = V just pressed, show level-0 root menu
+  // phase 1 = A just pressed, show Level-1 Attack submenu
+  // phase 2 = F just pressed, briefly show final key then fade
+
+  const PAD = 16, ROW = 26, COL_W = 260;
+  const menuX = OX + 10, menuY = 50; // top-left corner of play area + HUD
+
+  let title, items, activeKey;
+
+  if (phase === 0) {
+    title = 'VGS';
+    items = Object.entries(VGS_TREE.children).map(([k, v]) => ({ key: k, label: v.label }));
+    activeKey = sequence[0]; // 'V' highlight is the V activation itself
+  } else if (phase === 1) {
+    title = `VGS ▶ Attack`;
+    const sub = VGS_TREE.children[sequence[1]]; // 'A'
+    items = sub ? Object.entries(sub.children).map(([k, v]) => ({ key: k, label: v.label })) : [];
+    activeKey = sequence[2]; // 'F' — the one about to be pressed
+  } else {
+    title = `VGS ▶ Attack`;
+    const sub = VGS_TREE.children[sequence[1]];
+    items = sub ? Object.entries(sub.children).map(([k, v]) => ({ key: k, label: v.label })) : [];
+    activeKey = sequence[2];
+  }
+
+  // Layout: 2-column grid
+  const cols = 2;
+  const rows = Math.ceil(items.length / cols);
+  const boxW = cols * COL_W + PAD * 2;
+  const boxH = PAD + ROW + PAD/2 + rows * ROW + PAD;
+
+  // Background
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  roundRect(ctx, menuX, menuY, boxW, boxH, 6);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.lineWidth = 1;
+  roundRect(ctx, menuX, menuY, boxW, boxH, 6);
+  ctx.stroke();
+
+  // Title
+  ctx.font = 'bold 14px monospace';
+  ctx.fillStyle = teamClr;
+  ctx.textAlign = 'left';
+  ctx.fillText(title, menuX + PAD, menuY + PAD + 10);
+
+  // Separator
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(menuX + PAD, menuY + PAD + ROW);
+  ctx.lineTo(menuX + boxW - PAD, menuY + PAD + ROW);
+  ctx.stroke();
+
+  // Items
+  ctx.font = '13px monospace';
+  items.forEach(({ key, label }, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const ix = menuX + PAD + col * COL_W;
+    const iy = menuY + PAD + ROW + PAD/2 + row * ROW + 14;
+    const isActive = key === activeKey;
+
+    if (isActive) {
+      ctx.fillStyle = teamClr + 'aa';
+      ctx.fillRect(ix - 4, iy - 14, COL_W - 4, ROW - 2);
+    }
+
+    ctx.fillStyle = '#ddd';
+    ctx.fillText(`[${key}]`, ix, iy);
+    ctx.fillStyle = isActive ? '#fff' : '#aaa';
+    ctx.fillText(` ${label}`, ix + 28, iy);
+  });
+}
+
+function drawVGSChat(playerName, phrase, teamClr, alpha) {
+  if (alpha <= 0) return;
+  const chatY = 48; // just below the HUD bar
+  const chatX = OX + 10;
+  const text = `(${playerName}): ${phrase}`;
+
+  ctx.font = 'bold 14px sans-serif';
+  const tw = ctx.measureText(text).width;
+
+  ctx.fillStyle = `rgba(0,0,0,${0.7 * alpha})`;
+  roundRect(ctx, chatX - 6, chatY + 2, tw + 20, 24, 4);
+  ctx.fill();
+
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = teamClr;
+  ctx.textAlign = 'left';
+  ctx.fillText(text, chatX + 4, chatY + 18);
+  ctx.globalAlpha = 1;
+}
+
+function roundRect(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x+r, y);
+  c.lineTo(x+w-r, y); c.quadraticCurveTo(x+w, y, x+w, y+r);
+  c.lineTo(x+w, y+h-r); c.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+  c.lineTo(x+r, y+h); c.quadraticCurveTo(x, y+h, x, y+h-r);
+  c.lineTo(x, y+r); c.quadraticCurveTo(x, y, x+r, y);
+  c.closePath();
+}
+
+init();
+</script>
+</body>
+</html>
