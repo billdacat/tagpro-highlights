@@ -13,13 +13,16 @@
 // --max-minutes=M    Cap the reel length; clips are ranked across games to fit.
 //                    Default: 8 for multi-game reels, unlimited for a single game.
 // --dry-run          Resolve games, score highlights, print the reel plan, then stop.
+// --restitch         Skip recording; rebuild cards/captions/reel from the clips of the last run.
+// --transition=T     cut (default: hard cuts, dip-to-black at cards) | fade | dissolve
+// --no-captions      Skip the lower-third caption burned onto each clip.
 // --login            Open Chrome so you can log into TagPro, then extract session cookies
 //
 // Output (single game): output/clips/clip_01.mp4 ... output/game-summary.mp4
 // Output (multi game) : output/match/game_NN/... output/match-highlights.mp4
 
 import { chromium }   from 'playwright';
-import { mkdirSync, createWriteStream, readFileSync } from 'fs';
+import { mkdirSync, createWriteStream, readFileSync, writeFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execFileSync, execSync } from 'child_process';
@@ -28,6 +31,7 @@ import { parseReplay }    from './parse-replay.js';
 import { scoreHighlights } from './score-highlights.js';
 import { fetchMatchup, describeMatchup } from './mltp.js';
 import { makeSeriesIntroCard, makeGameTitleCard, makeSeriesFinalCard, CARD_SECONDS } from './series-cards.js';
+import { captionFor, renderCaptionPng, burnCaption } from './captions.js';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 
@@ -47,12 +51,17 @@ const CAPS_ONLY  = process.argv.includes('--caps-only');
 const MAX_CLIPS  = parseInt(flag('clips') ?? positional[4] ?? '10');
 const MAX_MINUTES = flag('max-minutes') != null ? parseFloat(flag('max-minutes')) : null;
 const DRY_RUN    = process.argv.includes('--dry-run');
+const RESTITCH   = process.argv.includes('--restitch');
+const TRANSITION = flag('transition') ?? 'cut';        // cut | fade | dissolve
+const CAPTIONS   = !process.argv.includes('--no-captions');
 // --debug-clip: record only clip 1, starting from t=0, so you can watch the
 // full game start and see exactly where the focal player appears/disappears.
 const DEBUG_CLIP = process.argv.includes('--debug-clip');
 if (MAX_MINUTES != null && !(MAX_MINUTES > 0)) throw new Error('--max-minutes must be a positive number');
+if (!['cut', 'fade', 'dissolve'].includes(TRANSITION)) throw new Error(`--transition must be cut, fade or dissolve (got "${TRANSITION}")`);
 
-const DISSOLVE_SEC  = 1.5;
+const DISSOLVE_SEC  = 1.5;  // overlap per join in the fade/dissolve modes
+const CARD_FADE_SEC = 0.5;  // dip-to-black at card boundaries in cut mode
 const INTRO_SEC     = 4;    // gameplay cold-open recorded at the flags-live moment
 const RECAP_SEC     = 7;    // featured-players recap card
 const SCOREBOARD_SEC = 8;   // full box-score card (single-game reels only)
@@ -71,9 +80,9 @@ function getVideoDurationSec(filePath) {
   return parseFloat(stream.duration);
 }
 
-// Stitch clips together with 0.5 s cross-dissolves between each pair.
-// Uses chained ffmpeg xfade filters — no intermediate transition files needed.
-function stitchWithDissolve(clipPaths, outputPath, dissolveSec = 0.5) {
+// Stitch clips together with a cross-blend (xfade `fade` or `dissolve`) between
+// each pair.  Uses chained ffmpeg xfade filters — no intermediate transition files needed.
+function stitchWithDissolve(clipPaths, outputPath, dissolveSec = DISSOLVE_SEC, transition = 'dissolve') {
   if (clipPaths.length === 1) {
     execFileSync('ffmpeg', [
       '-y', '-i', clipPaths[0],
@@ -102,12 +111,12 @@ function stitchWithDissolve(clipPaths, outputPath, dissolveSec = 0.5) {
     const isLast   = i === clipPaths.length - 1;
     const outLabel = isLast ? 'vout' : `xf${i}`;
     filters.push(
-      `${prevLabel}[nv${i}]xfade=transition=dissolve:duration=${dissolveSec}:offset=${cumOffset.toFixed(4)}[${outLabel}]`
+      `${prevLabel}[nv${i}]xfade=transition=${transition}:duration=${dissolveSec}:offset=${cumOffset.toFixed(4)}[${outLabel}]`
     );
     prevLabel = `[${outLabel}]`;
   }
 
-  console.log(`  Stitching ${clipPaths.length} clips with ${dissolveSec}s dissolves...`);
+  console.log(`  Stitching ${clipPaths.length} clips with ${dissolveSec}s ${transition}s...`);
   execFileSync('ffmpeg', [
     '-y',
     ...inputs,
@@ -117,6 +126,53 @@ function stitchWithDissolve(clipPaths, outputPath, dissolveSec = 0.5) {
     '-an',
     outputPath,
   ]);
+}
+
+// Hard cuts between gameplay clips; a short dip to black wherever a card meets
+// anything else.  `segments` is [{ path, kind: 'clip' | 'card' }].  Runs of
+// consecutive clips are concatenated into one node, then nodes are joined with
+// xfade=fadeblack.
+function stitchCuts(segments, outputPath, fadeSec = CARD_FADE_SEC) {
+  const inputs  = segments.flatMap(s => ['-i', s.path]);
+  const durs    = segments.map(s => getVideoDurationSec(s.path));
+  // settb: concat emits microsecond timestamps while fps= emits 1/30, and xfade refuses
+  // to join inputs whose timebases differ, so every node is pinned to AV_TIME_BASE.
+  const filters = segments.map((_, i) => `[${i}:v]fps=30,scale=1280:720,setpts=PTS-STARTPTS,settb=AVTB[n${i}]`);
+
+  const nodes = [];
+  segments.forEach((s, i) => {
+    const last = nodes[nodes.length - 1];
+    if (s.kind === 'clip' && last?.kind === 'clip') { last.idx.push(i); last.dur += durs[i]; }
+    else nodes.push({ kind: s.kind, idx: [i], dur: durs[i] });
+  });
+  nodes.forEach((n, k) => {
+    n.label = n.idx.length === 1 ? `n${n.idx[0]}` : `run${k}`;
+    if (n.idx.length > 1)
+      filters.push(`${n.idx.map(i => `[n${i}]`).join('')}concat=n=${n.idx.length}:v=1:a=0,settb=AVTB[${n.label}]`);
+  });
+
+  let prev = nodes[0].label, offset = 0;
+  for (let k = 1; k < nodes.length; k++) {
+    offset += nodes[k - 1].dur - fadeSec;
+    const out = k === nodes.length - 1 ? 'vout' : `x${k}`;
+    filters.push(`[${prev}][${nodes[k].label}]xfade=transition=fadeblack:duration=${fadeSec}:offset=${offset.toFixed(4)}[${out}]`);
+    prev = out;
+  }
+
+  const clips = segments.filter(s => s.kind === 'clip').length;
+  console.log(`  Stitching ${segments.length} segments: ${clips} hard-cut clip(s), ${nodes.length - 1} ${fadeSec}s dip(s) to black...`);
+  execFileSync('ffmpeg', [
+    '-y', ...inputs,
+    '-filter_complex', filters.join(';'),
+    '-map', `[${prev}]`,
+    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
+    '-an', outputPath,
+  ]);
+}
+
+function stitch(segments, outputPath) {
+  if (TRANSITION === 'cut') stitchCuts(segments, outputPath, CARD_FADE_SEC);
+  else stitchWithDissolve(segments.map(s => s.path), outputPath, DISSOLVE_SEC, TRANSITION);
 }
 
 // ── Game-summary card (PIL renderer) ──────────────────────────────────────────
@@ -691,9 +747,18 @@ window.__tpRecord = (sliderMs, durationMs, targetW, targetH, bitrateMbps, focusP
         const ctx = rc.getContext('2d');
         ctx.globalCompositeOperation = 'copy';
 
+        // TagPro's canvas is 16:10 (1280x800 native, scaled to fit the window), so
+        // stretching it onto a 16:9 frame squashes everything by ~11%.  Instead take
+        // a same-aspect crop: centred horizontally, anchored to the bottom so the
+        // score/clock HUD stays and the FPS/ping readout at the top is what goes.
+        const scale = Math.max(w / src.width, h / src.height);
+        const sw = Math.round(w / scale), sh = Math.round(h / scale);
+        const sx = Math.round((src.width - sw) / 2), sy = src.height - sh;
+        log('canvas ' + src.width + 'x' + src.height + ' → crop ' + sw + 'x' + sh + ' at (' + sx + ',' + sy + ') → ' + w + 'x' + h);
+
         let lastTs = 0, rafId;
         const copyFrame = ts => {
-          if (ts - lastTs >= 1000 / 60) { ctx.drawImage(src, 0, 0, w, h); lastTs = ts; }
+          if (ts - lastTs >= 1000 / 60) { ctx.drawImage(src, sx, sy, sw, sh, 0, 0, w, h); lastTs = ts; }
           rafId = requestAnimationFrame(copyFrame);
         };
         rafId = requestAnimationFrame(copyFrame);
@@ -723,9 +788,13 @@ window.__tpRecord = (sliderMs, durationMs, targetW, targetH, bitrateMbps, focusP
           resolve(ext);
         };
 
-        mr.start(200);
-        log('recording started for ' + durationMs + 'ms');
-        setTimeout(() => { log('stopping'); mr.stop(); }, durationMs);
+        // Let the renderer draw two frames on the new POV before capturing, so the
+        // first recorded frame is already centred on the focal player.
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          mr.start(200);
+          log('recording started for ' + durationMs + 'ms');
+          setTimeout(() => { log('stopping'); mr.stop(); }, durationMs);
+        }));
 
       }, 500); // settle after play()
     };
@@ -850,16 +919,22 @@ async function prepareGame(game, multi) {
 const clipSec = c => (c.endMs - c.startMs) / 1000;
 
 function planReel(games, { multi, budgetSec }) {
+  const n = games.length;
   const cardSec = multi
-    ? CARD_SECONDS.intro + CARD_SECONDS.final + games.length * (CARD_SECONDS.game + RECAP_SEC)
+    ? CARD_SECONDS.intro + CARD_SECONDS.final + n * (CARD_SECONDS.game + RECAP_SEC)
     : INTRO_SEC + RECAP_SEC + SCOREBOARD_SEC;
-  const cardSegments = multi ? 2 + 2 * games.length : 3;
-  let total = cardSec - DISSOLVE_SEC * (cardSegments - 1);
+  // Overlapping joins: in cut mode only card boundaries dip to black (title→clips,
+  // clips→recap, and between series segments); in the blend modes every join overlaps.
+  const cut         = TRANSITION === 'cut';
+  const cardJoins   = multi ? (cut ? 3 * n + 1 : 2 * n + 1) : 2;
+  const cardOverlap = cut ? CARD_FADE_SEC : DISSOLVE_SEC;
+  const clipOverlap = cut ? 0 : DISSOLVE_SEC;
+  let total = cardSec - cardOverlap * cardJoins;
 
   const all = games.flatMap(g => g.clips.map(c => ({ g, c, dur: clipSec(c), isCap: c.focalType === 'capture' })));
 
   if (budgetSec == null) {
-    total += all.reduce((s, x) => s + x.dur - DISSOLVE_SEC, 0);
+    total += all.reduce((s, x) => s + x.dur - clipOverlap, 0);
     return { estimatedSec: total, kept: all.length, dropped: 0 };
   }
 
@@ -870,7 +945,7 @@ function planReel(games, { multi, budgetSec }) {
 
   const chosen = new Set();
   const tryAdd = x => {
-    const add = x.dur - DISSOLVE_SEC;
+    const add = x.dur - clipOverlap;
     if (total + add > budgetSec) return false;
     chosen.add(x.c); total += add; return true;
   };
@@ -972,13 +1047,17 @@ async function recordGame(page, game) {
   console.log(`  ✓ intro.mp4  (${(gameStartMs / 1000).toFixed(1)}s mark)\n`);
 
   game.clipPaths = [];
-  let prevFocal = null;  // focal player from the previous clip, for mid-dissolve POV switch
-  const povSwitchMs = Math.round(DISSOLVE_SEC * 500);  // switch at 50% of dissolve duration
+  // In the blend modes each clip starts on the previous clip's focal player and switches
+  // POV mid-blend so the overlap shows one map region.  Hard cuts have no overlap, so
+  // every clip simply starts on its own focal player.
+  const blendPov    = TRANSITION !== 'cut';
+  let prevFocal     = null;
+  const povSwitchMs = Math.round(DISSOLVE_SEC * 500);  // switch at 50% of the blend
 
   for (let i = 0; i < clips.length; i++) {
     const clip  = clips[i];
     const focal = clip.focalPlayer ?? clip.players[0];
-    const label = `clip_${String(i + 1).padStart(2, '0')}`;
+    const label = clip.label;
 
     // --debug-clip: record only clip 1, from t=0 through the focal event,
     // so you can watch where the focal player is throughout the game start.
@@ -994,7 +1073,7 @@ async function recordGame(page, game) {
     try {
       const path = await recordClip(page, clipsDir, label, { sliderMs, durationMs, focal, prevFocal, povSwitchMs });
       game.clipPaths.push(path);
-      prevFocal = focal;
+      prevFocal = blendPov ? focal : null;
       console.log(`    ✓ ${label}.mp4\n`);
     } catch (err) {
       console.error(`    ✗ ${label} failed: ${err.message}`);
@@ -1002,6 +1081,7 @@ async function recordGame(page, game) {
       break;
     }
   }
+  game.clips = game.clips.slice(0, game.clipPaths.length);   // keep clips and files aligned
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────
@@ -1047,13 +1127,7 @@ if (multi) {
   }
 }
 
-// 2. Plan the reel against the duration budget.
-const budgetSec = MAX_MINUTES != null ? MAX_MINUTES * 60 : (multi ? DEFAULT_MULTI_MAX_MINUTES * 60 : null);
-const plan = planReel(games, { multi, budgetSec });
-printPlan(games, plan, budgetSec);
-if (DRY_RUN) { console.log('\n--dry-run: stopping before recording.'); process.exit(0); }
-
-// 3. Output layout
+// 2. Output layout
 //    single game : output/clips/*.mp4                 → output/game-summary.mp4
 //    multi game  : output/match/game_NN/clips/*.mp4   → output/match/game_NN/game-summary.mp4
 //                  output/match/cards/*.mp4           → output/match-highlights.mp4
@@ -1062,59 +1136,92 @@ const MATCH_DIR = `${OUT_DIR}/match`;
 for (const g of games) {
   g.dir      = multi ? `${MATCH_DIR}/game_${String(g.gameNumber).padStart(2, '0')}` : OUT_DIR;
   g.clipsDir = `${g.dir}/clips`;
-  mkdirSync(g.clipsDir, { recursive: true });
+  g.planPath = `${g.dir}/plan.json`;
+}
+
+// 3. Plan the reel against the duration budget.  With --restitch, reload the plan
+//    the recording run saved so the existing clip files line up with it.
+const budgetSec = MAX_MINUTES != null ? MAX_MINUTES * 60 : (multi ? DEFAULT_MULTI_MAX_MINUTES * 60 : null);
+if (RESTITCH) {
+  for (const g of games) {
+    if (!existsSync(g.planPath)) throw new Error(`--restitch: ${g.planPath} not found — record this game first`);
+    const saved = JSON.parse(readFileSync(g.planPath, 'utf8'));
+    g.clips     = saved.clips.filter(c => {
+      const ok = existsSync(`${g.clipsDir}/${c.label}.mp4`);
+      if (!ok) console.warn(`  ! ${g.clipsDir}/${c.label}.mp4 missing — skipping that clip`);
+      return ok;
+    });
+    g.clipPaths = g.clips.map(c => `${g.clipsDir}/${c.label}.mp4`);
+    g.introPath = `${g.clipsDir}/intro.mp4`;
+  }
+  printPlan(games, planReel(games, { multi, budgetSec: null }), null);
+} else {
+  const plan = planReel(games, { multi, budgetSec });
+  printPlan(games, plan, budgetSec);
+  if (DRY_RUN) { console.log('\n--dry-run: stopping before recording.'); process.exit(0); }
+  for (const g of games) {
+    mkdirSync(g.clipsDir, { recursive: true });
+    g.clips.forEach((c, i) => { c.label = `clip_${String(i + 1).padStart(2, '0')}`; });
+    writeFileSync(g.planPath, JSON.stringify({
+      gameNumber: g.gameNumber, matchId: g.matchId ?? null, mapName: g.mapName,
+      replayKey: g.replayKey, clips: g.clips,
+    }, null, 2));
+  }
 }
 if (multi) mkdirSync(`${MATCH_DIR}/cards`, { recursive: true });
 
-// 4. Auth via cookie injection
-//
-// Instead of trying to launch Chrome with a debug port (blocked by macOS's
-// singleton mechanism), we read TagPro's session cookies directly from
-// Chrome's profile database and inject them into Playwright's own Chromium.
+if (!RESTITCH) {
+  // 4. Auth via cookie injection
+  //
+  // Instead of trying to launch Chrome with a debug port (blocked by macOS's
+  // singleton mechanism), we read TagPro's session cookies directly from
+  // Chrome's profile database and inject them into Playwright's own Chromium.
 
-const COOKIES_PY = resolve(__dir, 'extract_chrome_cookies.py');
+  const COOKIES_PY = resolve(__dir, 'extract_chrome_cookies.py');
 
-if (LOGIN_MODE) {
-  console.log('\nOpening Chrome for TagPro login...');
-  execFileSync('open', ['https://tagpro.koalabeast.com/login']);
-  console.log('  Log in with your Google account in the Chrome window.');
-  console.log('  Press Enter once you\'re on the TagPro home page...\n');
-  await new Promise(resolve => {
-    process.stdin.resume();
-    process.stdin.once('data', () => { process.stdin.pause(); resolve(); });
-  });
-  console.log('Cookies will be read from Chrome\'s profile. Continuing...\n');
-}
-
-console.log('\nReading TagPro cookies from Chrome profile...');
-let tagproCookies = [];
-try {
-  const raw    = execFileSync('python3', [COOKIES_PY], { encoding: 'utf8' });
-  const parsed = JSON.parse(raw);
-  if (parsed.error) {
-    console.error(`  Cookie extraction warning: ${parsed.error}`);
-  } else {
-    tagproCookies = parsed.cookies;
-    console.log(`  Found ${tagproCookies.length} cookie(s) for tagpro.koalabeast.com`);
+  if (LOGIN_MODE) {
+    console.log('\nOpening Chrome for TagPro login...');
+    execFileSync('open', ['https://tagpro.koalabeast.com/login']);
+    console.log('  Log in with your Google account in the Chrome window.');
+    console.log('  Press Enter once you\'re on the TagPro home page...\n');
+    await new Promise(resolve => {
+      process.stdin.resume();
+      process.stdin.once('data', () => { process.stdin.pause(); resolve(); });
+    });
+    console.log('Cookies will be read from Chrome\'s profile. Continuing...\n');
   }
-} catch (err) {
-  console.error(`  Cookie extractor failed: ${err.message}`);
-}
 
-// Launch Playwright's own Chromium (no system Chrome needed)
-console.log('Launching browser...');
-const browser = await chromium.launch({ headless: false });
-const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
-if (tagproCookies.length > 0) await context.addCookies(tagproCookies);
+  console.log('\nReading TagPro cookies from Chrome profile...');
+  let tagproCookies = [];
+  try {
+    const raw    = execFileSync('python3', [COOKIES_PY], { encoding: 'utf8' });
+    const parsed = JSON.parse(raw);
+    if (parsed.error) {
+      console.error(`  Cookie extraction warning: ${parsed.error}`);
+    } else {
+      tagproCookies = parsed.cookies;
+      console.log(`  Found ${tagproCookies.length} cookie(s) for tagpro.koalabeast.com`);
+    }
+  } catch (err) {
+    console.error(`  Cookie extractor failed: ${err.message}`);
+  }
 
-// 5. Record every game (one fresh tab per replay).
-for (const [i, g] of games.entries()) {
-  console.log(`\n[Game ${g.gameNumber}] (${i + 1}/${games.length}) ${g.mapName || ''}`);
-  const page = await openReplay(browser, context, g.replayKey, tagproCookies);
-  await recordGame(page, g);
-  await page.close();
+  // Launch Playwright's own Chromium (no system Chrome needed)
+  console.log('Launching browser...');
+  const browser = await chromium.launch({ headless: false });
+  // 1280x800 matches TagPro's native 16:10 canvas, so the recorder's 16:9 crop is 1:1 pixels.
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  if (tagproCookies.length > 0) await context.addCookies(tagproCookies);
+
+  // 5. Record every game (one fresh tab per replay).
+  for (const [i, g] of games.entries()) {
+    console.log(`\n[Game ${g.gameNumber}] (${i + 1}/${games.length}) ${g.mapName || ''}`);
+    const page = await openReplay(browser, context, g.replayKey, tagproCookies);
+    await recordGame(page, g);
+    await page.close();
+  }
+  await browser.close();
 }
-await browser.close();
 
 // Result rows for every game in the series, including games we could not export
 // (MLTP knows their scores), so running series scores stay right on the title cards.
@@ -1133,10 +1240,29 @@ const seriesScoreAfter = rows => rows.reduce((s, r) => {
   return s;
 }, [0, 0]);
 
-// 6. Per-game ending cards + per-game stitch.
+const seg = (path, kind) => ({ path, kind });
+
+// 6. Captions, per-game ending cards, per-game stitch.
 for (const g of games) {
   const { clipsDir, meta, playerStats, finalScore } = g;
-  console.log(`\n[Game ${g.gameNumber}] Generating recap card (featured players)...`);
+  console.log(`\n[Game ${g.gameNumber}] Finishing...`);
+
+  // Lower-third caption burned onto the opening seconds of each clip.
+  let clipPaths = g.clipPaths;
+  if (CAPTIONS && g.clips.length) {
+    const teamNames = { red: meta?.teams?.red?.name, blue: meta?.teams?.blue?.name };
+    clipPaths = g.clips.map((c, i) => {
+      const src = g.clipPaths[i];
+      const png = src.replace(/\.mp4$/, '.caption.png');
+      const out = src.replace(/\.mp4$/, '.captioned.mp4');
+      renderCaptionPng(png, captionFor(c, { gameNumber: multi ? g.gameNumber : null, teamNames }));
+      burnCaption(src, png, out);
+      return out;
+    });
+    console.log(`  ✓ captions burned onto ${clipPaths.length} clip(s)`);
+  }
+
+  console.log('  Generating recap card (featured players)...');
   makeRecapCard(`${clipsDir}/recap.png`, `${clipsDir}/recap.mp4`, meta, playerStats, finalScore);
   console.log('  ✓ recap.mp4');
 
@@ -1152,17 +1278,17 @@ for (const g of games) {
       home: series.home, away: series.away, footer: series.footer,
     });
     console.log('  ✓ title.mp4');
-    segments = [`${clipsDir}/title.mp4`, ...g.clipPaths, `${clipsDir}/recap.mp4`];
+    segments = [seg(`${clipsDir}/title.mp4`, 'card'), ...clipPaths.map(p => seg(p, 'clip')), seg(`${clipsDir}/recap.mp4`, 'card')];
   } else {
     console.log('  Generating full scoreboard card...');
     makeSummaryCard(`${clipsDir}/scoreboard.png`, `${clipsDir}/scoreboard.mp4`, meta, playerStats, finalScore);
     console.log('  ✓ scoreboard.mp4');
-    segments = [g.introPath, ...g.clipPaths, `${clipsDir}/recap.mp4`, `${clipsDir}/scoreboard.mp4`];
+    segments = [seg(g.introPath, 'clip'), ...clipPaths.map(p => seg(p, 'clip')),
+                seg(`${clipsDir}/recap.mp4`, 'card'), seg(`${clipsDir}/scoreboard.mp4`, 'card')];
   }
 
   g.reelPath = `${g.dir}/game-summary.mp4`;
-  console.log('  Stitching with cross-dissolves...');
-  stitchWithDissolve(segments, g.reelPath, DISSOLVE_SEC);
+  stitch(segments, g.reelPath);
   console.log(`  ✓ ${g.reelPath}`);
 }
 
@@ -1179,7 +1305,6 @@ makeSeriesIntroCard(`${cardsDir}/series-intro.png`, `${cardsDir}/series-intro.mp
   label: series.label, home: series.home, away: series.away,
   bestOf: series.bestOf, scheduledAt: series.scheduledAt, footer: series.footer,
 });
-
 makeSeriesFinalCard(`${cardsDir}/series-final.png`, `${cardsDir}/series-final.mp4`, {
   home: series.home, away: series.away,
   seriesScore: series.seriesScore ?? seriesScoreAfter(seriesRows),
@@ -1189,7 +1314,7 @@ console.log('  ✓ series-intro.mp4, series-final.mp4');
 
 const REEL = `${OUT_DIR}/match-highlights.mp4`;
 console.log('\nStitching series reel...');
-stitchWithDissolve([`${cardsDir}/series-intro.mp4`, ...games.map(g => g.reelPath), `${cardsDir}/series-final.mp4`], REEL, DISSOLVE_SEC);
+stitch([seg(`${cardsDir}/series-intro.mp4`, 'card'), ...games.map(g => seg(g.reelPath, 'card')), seg(`${cardsDir}/series-final.mp4`, 'card')], REEL);
 
 console.log(`\n✓ ${REEL}  (~${fmtSec(getVideoDurationSec(REEL))})`);
 console.log(`  open "${REEL}"`);

@@ -158,6 +158,7 @@ export function scoreHighlights({ events, playerIndex, meta, gameStartMs, actual
     endMs:       clip.end,
     score:       clip.totalScore,
     focalType:   clip.headline.type,
+    focalTeam:   clip.headline.team,     // 1 = red, 2 = blue
     focalPlayer: clip.focal.playerName,
     players:     clip.players,
     scoreAtClip: clip.scoreAtClip,

@@ -18,7 +18,7 @@ The project has two independent rendering pipelines plus one experimental side t
 4. **Render** — either:
    - `src/export-replay-clips.js` replays the game inside the real TagPro client (via an authenticated session) and screen-records each clip with `MediaRecorder`, or
    - `src/build-frame-data.js` + `src/render-clips.js` build per-frame JSON and drive the custom canvas renderer in `src/renderer/index.html`.
-5. **Stitch** — clips are concatenated with `ffmpeg` cross-dissolve transitions into a single highlight reel, with an optional generated scoreboard summary card at the end.
+5. **Stitch** — each clip gets a lower-third caption (`src/captions.js`), then clips are hard-cut together with `ffmpeg`, with a short dip to black around the generated cards (crossfade/dissolve joins are available via `--transition`), and a scoreboard summary card closes the reel.
 6. **Series reels** (multi-game) — `src/mltp.js` resolves an mltp.gg matchup to its tagpro.eu match IDs; every game is recorded in turn, clips from all games are ranked against one duration budget, and the per-game reels are joined with generated series intro, per-game title, and series final cards (`src/series-cards.js`).
 
 ## Requirements
@@ -73,6 +73,9 @@ node src/export-replay-clips.js [ndjsonPath] [flags]
 | `--mltp=<id or URL>` | An mltp.gg matchup ID or URL, e.g. `https://www.mltp.gg/matchup/<uuid>?tier=majors` (copy it from the [schedule](https://www.mltp.gg/schedule?tier=majors)). Pulls the tagpro.eu match ID of every game in the series and exports them all into one reel, in game order. |
 | `--max-minutes=<m>` | Cap the reel length. Clips from every game are ranked against this budget: captures first (by score), then filler clips of 30 s or less (by score density); each game keeps at least its best clip. Default: `8` for multi-game reels, unlimited for a single game. |
 | `--dry-run` | Resolve the games, score the highlights, print the reel plan and estimated length, then stop before opening the browser. Handy for checking what a series reel will contain. |
+| `--restitch` | Skip recording. Reloads the `plan.json` each run saves next to its clips and rebuilds captions, cards, and the reel from the existing clip files. Use it to iterate on the look without another real-time recording pass. |
+| `--transition=<t>` | How clips are joined. `cut` (default): hard cuts between plays, a 0.5 s dip to black wherever a card meets anything. `fade`: 1.5 s crossfade between everything. `dissolve`: the same with ffmpeg's noisy pixel dissolve. In the blend modes each clip starts on the previous clip's focal player and switches POV mid-blend to hide the camera jump. |
+| `--no-captions` | Skip the lower-third caption (event type, player, team) burned onto the opening seconds of each clip. |
 | `--replay=<key>` | Explicitly overrides the replay key used to build the `tagpro.koalabeast.com/game?replay=...` URL, instead of deriving it automatically or from `--match`. Single-game only. |
 | `--clips=<n>` | Max number of non-capture "filler" highlight clips to consider per game (default: `10`). Flag captures are always kept (subject to `--max-minutes`). |
 | `--caps-only` | Only export clips centered on flag captures. |
@@ -89,12 +92,13 @@ node src/export-replay-clips.js --mltp=e8a207df-74b2-46b1-919b-2c496dff9aeb --ma
 node src/export-replay-clips.js --match=4389828,4389843,4389859
 ```
 
-Each game is recorded in its own tab of the same logged-in browser, then the reel is assembled as: series intro card → for each game, a title card (map, series score so far, which colour each team plays), that game's highlight clips, and its recap card → series final card with every game's score. Team names and colours come from mltp.gg when available; with plain `--match` IDs they come from the replay's red/blue team names.
+Each game is recorded in its own tab of the same logged-in browser, then the reel is assembled as: series intro card → for each game, a title card (map, series score so far, which colour each team plays), that game's captioned highlight clips hard-cut together, and its recap card → series final card with every game's score. Cards are separated from gameplay by a short dip to black. Team names and colours come from mltp.gg when available; with plain `--match` IDs they come from the replay's red/blue team names.
 
 Output:
 
 ```
-output/match/game_01/clips/           title, clip_NN, recap (and intro, recorded for sprite warm-up)
+output/match/game_01/clips/           title, clip_NN (+ .captioned), recap (and intro, recorded for sprite warm-up)
+output/match/game_01/plan.json        the clips that were recorded, for --restitch
 output/match/game_01/game-summary.mp4 that game's section of the reel
 output/match/cards/                   series-intro, series-final
 output/match-highlights.mp4           the full series reel
@@ -158,7 +162,8 @@ This tool is macOS-only end-to-end: `generate-audio.js` shells out to the built-
 | `src/renderer/tiles.png` | TagPro tile spritesheet (640×720, 16×11 grid at 40px/tile) — not yet wired up, see below |
 | `src/export-replay-clips.js` | Main real-renderer export pipeline (auth, record, stitch, summary card, series reels) |
 | `src/mltp.js` | Resolves an mltp.gg matchup to its games and tagpro.eu match IDs |
-| `src/series-cards.js`, `src/series_cards.py` | Series intro, per-game title, and series final cards for multi-game reels |
+| `src/series-cards.js`, `src/series_cards.py` | Series intro, per-game title, series final cards, and the caption badge renderer |
+| `src/captions.js` | Builds each clip's lower-third caption and burns it in with ffmpeg |
 | `src/extract_chrome_cookies.py` | Reads/decrypts your local Chrome session cookie for TagPro auth |
 | `src/fetch-match.js` | Fetches match metadata from `tagpro.eu` |
 | `output/clips/` | Rendered clip videos (single game); series runs use `output/match/` |

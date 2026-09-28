@@ -295,11 +295,52 @@ def card_final(D, logo):
     return img
 
 
+# ── Lower-third caption badge (transparent, sized to its text) ────────────────
+# Burned onto the first seconds of each clip: a small gold label (event type)
+# over the clip description, with a team-coloured bar on the left.
+
+def card_caption(D, logo=None):
+    label = (D.get('label') or '').upper()
+    text = D.get('text') or ''
+    accent = {'red': CRED, 'blue': CBLUE}.get(D.get('team'), CG)
+    fl, ft = load_font(13, 'ui'), load_font(30, 'display')
+    probe = ImageDraw.Draw(Image.new('RGBA', (1, 1)))
+    lw = text_size(probe, label.replace('\u00b7', '  '), fl)[0] + 12 if label else 0
+    tw, th, tbb = text_size(probe, text, ft)
+    bar, pad = 5, 16
+    w = bar + pad + max(lw, tw) + pad
+    h = 12 + (20 if label else 0) + th + 14
+    img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, w - 1, h - 1], radius=6, fill=(10, 10, 26, 215))
+    d.rounded_rectangle([0, 0, bar + 6, h - 1], radius=6, fill=accent)
+    d.rectangle([bar, 0, bar + 6, h - 1], fill=(10, 10, 26, 215))
+    y = 12
+    if label:
+        parts = [p.strip() for p in label.split('\u00b7') if p.strip()]
+        x = bar + pad
+        for i, part in enumerate(parts):
+            pw, ph, pbb = text_size(d, part, fl)
+            d.text((x - pbb[0], y - pbb[1]), part, font=fl, fill=CG)
+            x += pw
+            if i < len(parts) - 1:
+                x += 8
+                d.ellipse([x, y + ph // 2 - 2, x + 4, y + ph // 2 + 2], fill=CG)
+                x += 12
+        y += 20
+    d.text((bar + pad - tbb[0], y - tbb[1]), text, font=ft, fill=CW)
+    return img
+
+
 def main():
     mode, out, data = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
     logo = sys.argv[4] if len(sys.argv) > 4 else None
-    fn = {'intro': card_intro, 'game': card_game, 'final': card_final}[mode]
-    fn(data, logo).convert('RGB').save(out)
+    fn = {'intro': card_intro, 'game': card_game, 'final': card_final, 'caption': card_caption}[mode]
+    img = fn(data, logo)
+    if mode == 'caption':
+        img.save(out)                      # keep alpha for overlaying
+    else:
+        img.convert('RGB').save(out)
 
 
 if __name__ == '__main__':
