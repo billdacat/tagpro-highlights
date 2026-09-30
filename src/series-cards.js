@@ -12,6 +12,24 @@ const LOGO_PATH = resolve(__dir, '../tagprologo.png');
 
 export const CARD_SECONDS = { intro: 5, game: 4, final: 8 };
 
+// rows: [{ gameNumber, score: [home, away] | null }] for every game in the series.
+// Series score once all the given games are played.
+export function seriesScoreAfter(rows) {
+  return rows.reduce((s, r) => {
+    if (r.score) {
+      if (r.score[0] > r.score[1]) s[0]++;
+      else if (r.score[1] > r.score[0]) s[1]++;
+    }
+    return s;
+  }, [0, 0]);
+}
+
+// Series score going INTO a game: earlier games only.  A game's title card is shown
+// before its clips, so it must never include that game's own result.
+export function seriesScoreEntering(rows, gameNumber) {
+  return seriesScoreAfter(rows.filter(r => r.gameNumber < gameNumber));
+}
+
 function renderCard(mode, pngPath, mp4Path, data, seconds) {
   execFileSync('python3', [CARDS_PY, mode, pngPath, JSON.stringify(data), LOGO_PATH]);
   execFileSync('ffmpeg', [

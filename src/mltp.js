@@ -58,6 +58,8 @@ const team = t => t ? {
   name:         t.name ?? '?',
   abbreviation: t.abbreviation ?? (t.name ?? '?').slice(0, 4).toUpperCase(),
   colorHex:     t.colorHex ?? null,
+  logoUrl:      t.logoUrl ?? t.logoMarkUrl ?? null,
+  logoPath:     null,          // set by downloadTeamLogos
 } : null;
 
 // Normalise the raw matchup object into what the exporter needs.
@@ -103,6 +105,33 @@ export async function fetchMatchup(input) {
 
   const matchup = normaliseMatchup(extractMatchupJson(html));
   matchup.url = url;
+  return matchup;
+}
+
+// Download both teams' logos into `dir` and set team.logoPath.  Files are named after
+// the team and the logo's version, so a team that changes its logo gets a fresh file and
+// an unchanged one is reused.  A logo that cannot be fetched is skipped, never fatal.
+export async function downloadTeamLogos(matchup, dir) {
+  const { mkdirSync, existsSync, writeFileSync } = await import('fs');
+  mkdirSync(dir, { recursive: true });
+  for (const t of [matchup.home, matchup.away]) {
+    if (!t?.logoUrl) continue;
+    try {
+      const url  = new URL(t.logoUrl);
+      const ext  = (url.pathname.match(/\.(png|webp|jpe?g|gif)$/i)?.[1] ?? 'png').toLowerCase();
+      const ver  = (url.searchParams.get('v') ?? '0').replace(/\W/g, '');
+      const safe = String(t.abbreviation || t.id).replace(/[^\w-]/g, '_');
+      const file = `${dir}/${safe}-${ver}.${ext}`;
+      if (!existsSync(file)) {
+        const res = await fetch(t.logoUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (tagpro-highlights)' } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        writeFileSync(file, Buffer.from(await res.arrayBuffer()));
+      }
+      t.logoPath = file;
+    } catch (err) {
+      console.warn(`  ! Could not fetch the ${t.name} logo (${err.message}); continuing without it`);
+    }
+  }
   return matchup;
 }
 

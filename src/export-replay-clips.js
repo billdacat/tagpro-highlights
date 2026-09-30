@@ -21,7 +21,7 @@
 // Output (single game): output/clips/clip_01.mp4 ... output/game-summary.mp4
 // Output (multi game) : output/match/game_NN/... output/match-highlights.mp4
 
-import { chromium }   from 'playwright';
+import { chromium, request as playwrightRequest } from 'playwright';
 import { mkdirSync, createWriteStream, readFileSync, writeFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -29,9 +29,11 @@ import { execFileSync, execSync } from 'child_process';
 import { get as httpsGet } from 'https';
 import { parseReplay }    from './parse-replay.js';
 import { scoreHighlights } from './score-highlights.js';
-import { fetchMatchup, describeMatchup } from './mltp.js';
-import { makeSeriesIntroCard, makeGameTitleCard, makeSeriesFinalCard, CARD_SECONDS } from './series-cards.js';
-import { captionFor, renderCaptionPng, burnCaption } from './captions.js';
+import { fetchMatchup, describeMatchup, downloadTeamLogos } from './mltp.js';
+import { makeSeriesIntroCard, makeGameTitleCard, makeSeriesFinalCard, CARD_SECONDS,
+         seriesScoreAfter, seriesScoreEntering } from './series-cards.js';
+import { captionsFor, renderCaptionPng, burnCaptions } from './captions.js';
+import { buildScoreboardData, makeCompareCard, makeBoxScoreCard } from './scoreboard-cards.js';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 
@@ -63,7 +65,7 @@ if (!['cut', 'fade', 'dissolve'].includes(TRANSITION)) throw new Error(`--transi
 const DISSOLVE_SEC  = 1.5;  // overlap per join in the fade/dissolve modes
 const CARD_FADE_SEC = 0.5;  // dip-to-black at card boundaries in cut mode
 const INTRO_SEC     = 4;    // gameplay cold-open recorded at the flags-live moment
-const RECAP_SEC     = 7;    // featured-players recap card
+const RECAP_SEC     = 7;    // team comparison card that closes each game
 const SCOREBOARD_SEC = 8;   // full box-score card (single-game reels only)
 const DEFAULT_MULTI_MAX_MINUTES = 8;
 const MAX_FILLER_SEC = 30;  // under a budget, non-cap clips longer than this are skipped
@@ -175,434 +177,6 @@ function stitch(segments, outputPath) {
   else stitchWithDissolve(segments.map(s => s.path), outputPath, DISSOLVE_SEC, TRANSITION);
 }
 
-// ── Game-summary card (PIL renderer) ──────────────────────────────────────────
-// Builds a 1280×720 scoreboard PNG and converts it to a short MP4 clip.
-
-const SUMMARY_CARD_PY = String.raw`
-import sys, json
-from PIL import Image, ImageDraw, ImageFont
-
-def load_font(size):
-    for p in [
-        '/System/Library/Fonts/Helvetica.ttc',
-        '/System/Library/Fonts/HelveticaNeue.ttc',
-        '/System/Library/Fonts/Supplemental/Arial.ttf',
-        '/Library/Fonts/Arial.ttf',
-    ]:
-        try: return ImageFont.truetype(p, size)
-        except: pass
-    return ImageFont.load_default()
-
-def fmt_time(v):
-    s = int(v or 0)
-    if s == 0: return '0s'
-    return f'{s//60}:{s%60:02d}' if s >= 60 else f'{s}s'
-
-def ctr(text, font, color, cx, cy):
-    bb = d.textbbox((0,0), text, font=font)
-    d.text((cx-(bb[2]-bb[0])//2, cy-(bb[3]-bb[1])//2), text, font=font, fill=color)
-
-def rgt(text, font, color, rx, cy):
-    bb = d.textbbox((0,0), text, font=font)
-    d.text((rx-(bb[2]-bb[0]), cy-(bb[3]-bb[1])//2), text, font=font, fill=color)
-
-W, H = 1280, 720
-D = json.loads(sys.argv[2])
-img = Image.new('RGB', (W, H), (8,8,20))
-d = ImageDraw.Draw(img)
-
-CR=(220,65,65); CB=(65,120,245); CG=(200,170,55); CW=(225,225,235)
-CD=(135,135,160); CL=(35,35,65); R0=(12,12,28); R1=(18,18,42)
-
-# Header
-d.rectangle([(0,0),(W,185)], fill=(14,14,34))
-d.rectangle([(0,0),(6,185)], fill=CR)
-d.rectangle([(W-6,0),(W,185)], fill=CB)
-
-ctr('G A M E   S U M M A R Y', load_font(19), CG, W//2, 24)
-d.rectangle([(20,25),(360,26)], fill=CL)
-d.rectangle([(920,25),(W-20,26)], fill=CL)
-
-rn=D.get('redName','Red'); bn=D.get('blueName','Blue')
-sr=D.get('scoreR',0);      sb=D.get('scoreB',0)
-ctr(rn, load_font(40), CR, W//4,   108)
-ctr(bn, load_font(40), CB, 3*W//4, 108)
-ctr(f'{sr}  -  {sb}', load_font(82), CW, W//2, 108)
-
-if sr > sb: d.rectangle([(W//4-72,148),(W//4+72,151)], fill=CR)
-elif sb > sr: d.rectangle([(3*W//4-72,148),(3*W//4+72,151)], fill=CB)
-
-d.rectangle([(0,183),(W,186)], fill=CL)
-d.rectangle([(636,183),(640,H-2)], fill=CL)
-
-# Column defs: (x, label, width, right_align)
-CLS = [(16,'PLAYER',155,False),(171,'CAP',46,True),(217,'RET',46,True),(263,'GRAB',52,True),(315,'HOLD',68,True),(383,'PREV',68,True),(451,'TAGS',46,True)]
-CLR = [(x+644,l,w,ra) for (x,l,w,ra) in CLS]
-
-fh=load_font(15); fn=load_font(20); fs=load_font(21)
-HY=196; UY=210
-
-for (x,lbl,w,ra) in CLS+CLR:
-    bb=d.textbbox((0,0),lbl,font=fh); tw=bb[2]-bb[0]
-    d.text((x+w-tw if ra else x, HY), lbl, font=fh, fill=CD)
-d.rectangle([(8,UY),(630,UY+1)], fill=CL)
-d.rectangle([(650,UY),(W-8,UY+1)], fill=CL)
-
-RY0=UY+6; RH=88
-
-def draw_rows(players, cols, tc):
-    for i,p in enumerate(players[:5]):
-        ry=RY0+i*RH; bg=R0 if i%2==0 else R1
-        x0=cols[0][0]-3; x1=cols[-1][0]+cols[-1][2]+3
-        d.rectangle([(x0,ry),(x1,ry+RH-4)], fill=bg)
-        vals=[
-            p.get('name','?'),
-            str(p.get('caps',0)),
-            str(p.get('returns',0)),
-            str(p.get('grabs',0)),
-            fmt_time(p.get('hold',0)),
-            fmt_time(p.get('prevent',0)),
-            str(p.get('tags',0)),
-        ]
-        my=ry+RH//2-2
-        for j,(x,_,w,ra) in enumerate(cols):
-            v=vals[j]; f=fn if j==0 else fs; c=tc if j==0 else CW
-            bb=d.textbbox((0,0),v,font=f); tw=bb[2]-bb[0]; th=bb[3]-bb[1]
-            d.text((x+w-tw if ra else x+4, my-th//2), v, font=f, fill=c)
-
-draw_rows(D.get('playersRed',[]),  CLS, CR)
-draw_rows(D.get('playersBlue',[]), CLR, CB)
-
-# Footer
-fy = max(RY0 + 5*RH + 8, H-90)
-d.rectangle([(0,fy-1),(W,fy)], fill=CL)
-mn = D.get('mapName','')
-if mn: ctr(mn, load_font(18), CD, W//2, fy+30)
-ctr('tagpro.koalabeast.com', load_font(14), (65,65,100), W//2, H-18)
-
-img.save(sys.argv[1])
-`.trim();
-
-// Collect final per-player stats from the raw playerStats map + meta.players roster.
-function buildPlayerSummaries(meta, playerStats) {
-  return (meta?.players ?? [])
-    .filter(p => p.team === 1 || p.team === 2)
-    .map(fp => {
-      const s = playerStats[fp.id] ?? {};
-      return {
-        name:     fp.displayName ?? s.name ?? `Player${fp.id}`,
-        team:     fp.team,
-        caps:     s['s-captures'] ?? 0,
-        returns:  s['s-returns']  ?? 0,
-        grabs:    s['s-grabs']   ?? 0,
-        tags:     s['s-tags']    ?? 0,
-        hold:     s['s-hold']    ?? 0,
-        prevent:  s['s-prevent'] ?? 0,
-        powerups: s['s-powerups'] ?? 0,
-      };
-    });
-}
-
-// ── Recap card (featured top players) ─────────────────────────────────────────
-// Two players spotlighted per team: top offense (caps) and top defense (returns).
-// Team aggregate stat comparison bars fill the bottom section.
-
-const RECAP_PY = String.raw`
-import sys, json
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
-F_DISPLAY = '/System/Library/Fonts/Supplemental/DIN Condensed Bold.ttf'
-F_UI      = '/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf'
-F_BODY    = '/System/Library/Fonts/Supplemental/Futura.ttc'
-
-def load_font(size, role='body'):
-    stacks = {
-        'display': [F_DISPLAY, F_UI, '/System/Library/Fonts/Helvetica.ttc'],
-        'ui':      [F_UI, F_DISPLAY, '/System/Library/Fonts/Helvetica.ttc'],
-        'body':    [F_BODY, '/System/Library/Fonts/HelveticaNeue.ttc'],
-    }
-    for p in stacks.get(role, stacks['body']):
-        try: return ImageFont.truetype(p, size)
-        except: pass
-    return ImageFont.load_default()
-
-def fmt_t(v):
-    s = int(v or 0)
-    if s == 0: return '0s'
-    return f'{s//60}:{s%60:02d}' if s >= 60 else f'{s}s'
-
-W, H = 1280, 720
-D = json.loads(sys.argv[2])
-LOGO_PATH = sys.argv[3] if len(sys.argv) > 3 else None
-
-CR, CB = (220, 65, 65), (65, 120, 245)
-CG = (210, 175, 60)
-CW = (230, 230, 240)
-CD = (120, 125, 150)
-CL = (40, 40, 72)
-
-DIVX = 641; LW = DIVX; RW = W - DIVX - 3
-HDR_H = 132; CH = 193
-C1Y = HDR_H + 1; C2Y = C1Y + CH + 4; B0Y = C2Y + CH + 8
-
-# ── Step 1: Background ────────────────────────────────────────────────────────
-img = Image.new('RGBA', (W, H), (10, 10, 26, 255))
-
-# Team-colored ambient wash from each side
-wash = Image.new('RGBA', (W, H), (0, 0, 0, 0))
-wd = ImageDraw.Draw(wash)
-wd.rectangle([(0, 0), (W//2 + 80, H)], fill=(*CR, 20))
-wd.rectangle([(W//2 - 80, 0), (W, H)], fill=(*CB, 20))
-wash = wash.filter(ImageFilter.GaussianBlur(radius=100))
-img = Image.alpha_composite(img, wash)
-
-# Card drop shadows
-shadows = Image.new('RGBA', (W, H), (0, 0, 0, 0))
-sd = ImageDraw.Draw(shadows)
-for x, y, w in [(0, C1Y, LW), (DIVX+3, C1Y, RW), (0, C2Y, LW), (DIVX+3, C2Y, RW)]:
-    sd.rounded_rectangle([x+5, y+5, x+w+4, y+CH+4], radius=9, fill=(0, 0, 0, 85))
-shadows = shadows.filter(ImageFilter.GaussianBlur(radius=7))
-img = Image.alpha_composite(img, shadows)
-
-# ── Main draw pass ────────────────────────────────────────────────────────────
-d = ImageDraw.Draw(img)
-
-rn = D.get('redName', 'Red');  bn = D.get('blueName', 'Blue')
-sr = D.get('scoreR', 0);       sb = D.get('scoreB', 0)
-
-# ── Header ────────────────────────────────────────────────────────────────────
-d.rectangle([(0, 0), (W, HDR_H)], fill=(9, 9, 24, 235))
-d.rectangle([(0, 0), (8, HDR_H)], fill=CR)
-d.rectangle([(W-8, 0), (W, HDR_H)], fill=CB)
-
-# Inner glow bloom from edge strips
-for side, color in [('left', CR), ('right', CB)]:
-    glow = Image.new('RGBA', (W, H), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    if side == 'left':
-        gd.rectangle([(8, 0), (50, HDR_H)], fill=(*color, 35))
-    else:
-        gd.rectangle([(W-50, 0), (W-8, HDR_H)], fill=(*color, 35))
-    glow = glow.filter(ImageFilter.GaussianBlur(radius=18))
-    img = Image.alpha_composite(img, glow)
-d = ImageDraw.Draw(img)
-
-# "GAME SUMMARY" label with flanking decorative lines
-fl = load_font(13, 'ui')
-lbl = 'GAME  SUMMARY'
-bb = d.textbbox((0, 0), lbl, font=fl)
-lx = W//2 - (bb[2]-bb[0])//2
-d.text((lx, 14), lbl, font=fl, fill=CG)
-d.rectangle([(22, 23), (lx-16, 24)], fill=CL)
-d.rectangle([(lx+(bb[2]-bb[0])+16, 23), (W-22, 24)], fill=CL)
-
-# Ball icon (red/blue split) between the two scores
-def draw_ball(cx, cy, r):
-    d.pieslice([cx-r, cy-r, cx+r, cy+r], 90, 270, fill=CB)
-    d.pieslice([cx-r, cy-r, cx+r, cy+r], 270, 90, fill=CR)
-    d.ellipse([cx-r, cy-r, cx+r, cy+r], outline=(10, 10, 28), width=3)
-    d.ellipse([cx-r+3, cy-r+3, cx+r-3, cy+r-3], outline=(200, 205, 230), width=1)
-    d.line([(cx, cy-r+2), (cx, cy+r-2)], fill=(10, 10, 28), width=2)
-
-# Split score: team-colored numbers in DIN Condensed flanking ball icon
-fs = load_font(88, 'display')
-r_str, b_str = str(sr), str(sb)
-bb_r = d.textbbox((0, 0), r_str, font=fs)
-BALL_CX, BALL_CY, BALL_R = W//2, 80, 22
-rx = BALL_CX - BALL_R - 28 - (bb_r[2]-bb_r[0])
-bx = BALL_CX + BALL_R + 28
-sy = 32
-d.text((rx+2, sy+2), r_str, font=fs, fill=(0,0,0), stroke_width=2, stroke_fill=(0,0,0))
-d.text((rx, sy), r_str, font=fs, fill=CR, stroke_width=2, stroke_fill=(80,0,0))
-bb_b = d.textbbox((0, 0), b_str, font=fs)
-d.text((bx+2, sy+2), b_str, font=fs, fill=(0,0,0), stroke_width=2, stroke_fill=(0,0,0))
-d.text((bx, sy), b_str, font=fs, fill=CB, stroke_width=2, stroke_fill=(0,20,90))
-draw_ball(BALL_CX, BALL_CY, BALL_R)
-
-# Team names in DIN Alternate Bold
-for name, tc, cx in [(rn, CR, LW//2), (bn, CB, DIVX+3+RW//2)]:
-    fn = load_font(34, 'ui')
-    bb = d.textbbox((0, 0), name, font=fn)
-    tx = cx - (bb[2]-bb[0])//2
-    d.text((tx+1, 94), name, font=fn, fill=(0, 0, 0))
-    d.text((tx, 93), name, font=fn, fill=tc)
-
-if sr > sb:   d.rectangle([(LW//2-68, 128), (LW//2+68, 131)], fill=CR)
-elif sb > sr: d.rectangle([(DIVX+3+RW//2-68, 128), (DIVX+3+RW//2+68, 131)], fill=CB)
-
-d.rectangle([(0, HDR_H), (W, HDR_H+2)], fill=CL)
-d.rectangle([(DIVX, HDR_H), (DIVX+3, H-2)], fill=CL)
-
-# Flag icon: pole + triangular flag
-def draw_flag(x, y, size, tc):
-    pw = max(2, size//9)
-    d.rectangle([(x, y), (x+pw, y+size)], fill=(200, 200, 215))
-    d.polygon([(x+pw, y+1), (x+int(size*0.65), y+int(size*0.28)), (x+pw, y+int(size*0.55))], fill=tc)
-
-# ── Player card ───────────────────────────────────────────────────────────────
-def draw_card(x, y, w, tc, role, p, stats):
-    r, g, b = tc
-    tcd = (max(0, r//7+4), max(0, g//7+4), max(0, b//7+6))
-    d.rounded_rectangle([x, y, x+w, y+CH], radius=9, fill=tcd, outline=tc, width=2)
-    d.rounded_rectangle([x, y, x+w, y+7], radius=9, fill=tc)
-    d.rectangle([x, y+4, x+w, y+7], fill=tc)
-    draw_flag(x+18, y+12, 16, tc)
-    d.text((x+38, y+13), role, font=load_font(12, 'ui'), fill=CG)
-    name = (p.get('name') or '').upper()
-    fn = load_font(52, 'display')
-    for sz in (52, 44, 36, 28, 22):
-        fn = load_font(sz, 'display')
-        bb = d.textbbox((0, 0), name, font=fn)
-        if bb[2]-bb[0] <= w-40: break
-    sk = (max(0, r-140), max(0, g-90), max(0, b-90))
-    d.text((x+20, y+36), name, font=fn, fill=tc, stroke_width=2, stroke_fill=sk)
-    d.rectangle([(x+16, y+107), (x+w-16, y+108)], fill=(r//5+6, g//5+6, b//5+22))
-    nb = len(stats)
-    bw2 = (w-22)//nb
-    fv  = load_font(34, 'display')
-    fls = load_font(10, 'body')
-    for i, (val, lbl2) in enumerate(stats):
-        cx2 = x + 11 + i*bw2 + bw2//2
-        bb = d.textbbox((0, 0), val, font=fv)
-        d.text((cx2-(bb[2]-bb[0])//2, y+113), val, font=fv, fill=CW)
-        bb = d.textbbox((0, 0), lbl2, font=fls)
-        d.text((cx2-(bb[2]-bb[0])//2, y+162), lbl2, font=fls, fill=CD)
-
-ro = D.get('redOffense', {});  bo = D.get('blueOffense', {})
-rd = D.get('redDefense', {});  bd = D.get('blueDefense', {})
-
-def os(p): return [(str(p.get('caps',0)),'CAPS'),(fmt_t(p.get('hold',0)),'HOLD'),(str(p.get('grabs',0)),'GRABS'),(str(p.get('powerups',0)),'POWERUPS')]
-def ds(p): return [(str(p.get('returns',0)),'RETURNS'),(fmt_t(p.get('prevent',0)),'PREVENT'),(str(p.get('tags',0)),'TAGS'),(str(p.get('powerups',0)),'POWERUPS')]
-
-draw_card(0,       C1Y, LW, CR, 'TOP OFFENSE', ro, os(ro))
-draw_card(DIVX+3,  C1Y, RW, CB, 'TOP OFFENSE', bo, os(bo))
-draw_card(0,       C2Y, LW, CR, 'TOP DEFENSE', rd, ds(rd))
-draw_card(DIVX+3,  C2Y, RW, CB, 'TOP DEFENSE', bd, ds(bd))
-
-# ── Team stat bars — label above, values on sides ─────────────────────────────
-tr = D.get('teamRed', {});  tb = D.get('teamBlue', {})
-BX0, BX1, BH, BSP = 185, 1095, 24, 50
-
-def bar(y, label, rv, bv, fmt_fn=str):
-    # Label centered above the bar
-    fbl = load_font(11, 'ui')
-    bb = d.textbbox((0, 0), label, font=fbl)
-    tw, th = bb[2]-bb[0], bb[3]-bb[1]
-    d.text((W//2 - tw//2, y), label, font=fbl, fill=CD)
-    # Bar below label
-    by = y + th + 4
-    tot = (rv+bv) or 1
-    bw2 = BX1-BX0; rw2 = int(bw2*rv/tot); bww = bw2-rw2
-    d.rounded_rectangle([BX0, by, BX1, by+BH], radius=BH//2, fill=(18, 18, 44))
-    if rw2 > 2: d.rounded_rectangle([BX0, by, BX0+rw2, by+BH], radius=BH//2, fill=CR)
-    if bww > 2: d.rounded_rectangle([BX1-bww, by, BX1, by+BH], radius=BH//2, fill=CB)
-    d.rectangle([(BX0+rw2-1, by), (BX0+rw2, by+BH)], fill=(8, 8, 20))
-    # Values on sides in DIN Condensed
-    fv = load_font(20, 'display')
-    rv_s, bv_s = fmt_fn(rv), fmt_fn(bv)
-    bb = d.textbbox((0, 0), rv_s, font=fv)
-    d.text((BX0-(bb[2]-bb[0])-12, by+BH//2-(bb[3]-bb[1])//2), rv_s, font=fv, fill=CW)
-    bb = d.textbbox((0, 0), bv_s, font=fv)
-    d.text((BX1+12, by+BH//2-(bb[3]-bb[1])//2), bv_s, font=fv, fill=CW)
-
-bar(B0Y+10,        'GRABS',     tr.get('grabs',0),   tb.get('grabs',0))
-bar(B0Y+10+BSP,    'RETURNS',   tr.get('returns',0), tb.get('returns',0))
-bar(B0Y+10+BSP*2,  'HOLD TIME', tr.get('hold',0),    tb.get('hold',0), fmt_t)
-
-# ── Footer: map name | logo | attribution ─────────────────────────────────────
-LOGO_H = 32; logo_y = H - LOGO_H - 5; text_cy = logo_y + LOGO_H//2
-mn = D.get('mapName', '')
-if mn:
-    fm = load_font(13, 'body')
-    bb = d.textbbox((0, 0), mn, font=fm)
-    d.text((28, text_cy-(bb[3]-bb[1])//2), mn, font=fm, fill=CD)
-if LOGO_PATH:
-    try:
-        logo = Image.open(LOGO_PATH).convert('RGBA')
-        logo_w = int(LOGO_H * logo.size[0] / logo.size[1])
-        logo = logo.resize((logo_w, LOGO_H), Image.LANCZOS)
-        img.alpha_composite(logo, (W//2 - logo_w//2, logo_y))
-        d = ImageDraw.Draw(img)
-    except:
-        pass
-fa = load_font(10, 'body')
-attr = 'tagpro.koalabeast.com'
-bb = d.textbbox((0, 0), attr, font=fa)
-d.text((W-(bb[2]-bb[0])-28, text_cy-(bb[3]-bb[1])//2), attr, font=fa, fill=(55, 55, 90))
-
-img.convert('RGB').save(sys.argv[1])
-`.trim();
-
-function makeRecapCard(pngPath, mp4Path, meta, playerStats, finalScore) {
-  const all  = buildPlayerSummaries(meta, playerStats);
-  const red  = all.filter(p => p.team === 1);
-  const blue = all.filter(p => p.team === 2);
-
-  const topCap = arr => [...arr].sort((a, b) => b.caps - a.caps || b.hold - a.hold)[0] ?? {};
-  const topDef = arr => [...arr].sort((a, b) => b.returns - a.returns || b.prevent - a.prevent)[0] ?? {};
-  const totals  = arr => arr.reduce((t, p) => ({
-    grabs:   (t.grabs   || 0) + p.grabs,
-    returns: (t.returns || 0) + p.returns,
-    hold:    (t.hold    || 0) + p.hold,
-    prevent: (t.prevent || 0) + p.prevent,
-  }), {});
-
-  const redName  = meta?.teamNames?.red  ?? meta?.teams?.red?.name  ?? 'Red';
-  const blueName = meta?.teamNames?.blue ?? meta?.teams?.blue?.name ?? 'Blue';
-
-  const data = JSON.stringify({
-    redName, blueName,
-    scoreR:      finalScore?.r ?? 0,
-    scoreB:      finalScore?.b ?? 0,
-    mapName:     meta?.map ?? meta?.mapName ?? '',
-    redOffense:  topCap(red),
-    redDefense:  topDef(red),
-    blueOffense: topCap(blue),
-    blueDefense: topDef(blue),
-    teamRed:     totals(red),
-    teamBlue:    totals(blue),
-  });
-
-  const logoPath = resolve(__dir, '../tagprologo.png');
-  execFileSync('python3', ['-c', RECAP_PY, pngPath, data, logoPath]);
-  execFileSync('ffmpeg', [
-    '-y', '-loop', '1', '-i', pngPath,
-    '-t', String(RECAP_SEC), '-r', '30',
-    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
-    '-vf', 'scale=1280:720', '-an', mp4Path,
-  ]);
-}
-
-// Render a 1280×720 scoreboard PNG then convert it to an MP4 still clip.
-function makeSummaryCard(pngPath, mp4Path, meta, playerStats, finalScore) {
-  const all  = buildPlayerSummaries(meta, playerStats);
-  const sort = (arr) => [...arr].sort((a,b) => b.caps - a.caps || b.returns - a.returns);
-
-  // Try to find team names in the meta (some NDJSON formats include them)
-  const redName  = meta?.teamNames?.red  ?? meta?.teams?.red?.name  ?? 'Red';
-  const blueName = meta?.teamNames?.blue ?? meta?.teams?.blue?.name ?? 'Blue';
-
-  const data = JSON.stringify({
-    redName,
-    blueName,
-    scoreR:      finalScore?.r ?? 0,
-    scoreB:      finalScore?.b ?? 0,
-    mapName:     meta?.map ?? meta?.mapName ?? meta?.levelName ?? '',
-    playersRed:  sort(all.filter(p => p.team === 1)),
-    playersBlue: sort(all.filter(p => p.team === 2)),
-  });
-
-  execFileSync('python3', ['-c', SUMMARY_CARD_PY, pngPath, data]);
-
-  execFileSync('ffmpeg', [
-    '-y', '-loop', '1', '-i', pngPath,
-    '-t', String(SCOREBOARD_SEC), '-r', '30',
-    '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
-    '-vf', 'scale=1280:720',
-    '-an', mp4Path,
-  ]);
-}
-
 function fetchJSON(url) {
   return new Promise((resolve, reject) => {
     httpsGet(url, { headers: { Accept: 'application/json' } }, res => {
@@ -658,6 +232,56 @@ function downloadFile(url, destPath) {
   });
 }
 
+// TagPro session cookies, read once from Chrome's profile (see extract_chrome_cookies.py).
+// Instead of trying to launch Chrome with a debug port (blocked by macOS's singleton
+// mechanism), we read the cookies from Chrome's profile database and hand them to
+// Playwright.
+let tagproCookiesCache = null;
+function getTagproCookies() {
+  if (tagproCookiesCache) return tagproCookiesCache;
+  console.log('  Reading TagPro cookies from Chrome profile...');
+  tagproCookiesCache = [];
+  try {
+    const raw    = execFileSync('python3', [resolve(__dir, 'extract_chrome_cookies.py')], { encoding: 'utf8' });
+    const parsed = JSON.parse(raw);
+    if (parsed.error) {
+      console.error(`  Cookie extraction warning: ${parsed.error}`);
+    } else {
+      tagproCookiesCache = parsed.cookies;
+      console.log(`  Found ${tagproCookiesCache.length} cookie(s) for tagpro.koalabeast.com`);
+    }
+  } catch (err) {
+    console.error(`  Cookie extractor failed: ${err.message}`);
+  }
+  return tagproCookiesCache;
+}
+
+// Some replay files are only served to logged-in users.  Fetch with the same TagPro
+// session the recording browser uses.  Redirects are not followed, so the session
+// cookie is only ever sent to the host in `url`.
+async function downloadFileWithSession(url, destPath) {
+  const cookies = getTagproCookies();
+  if (!cookies.length) throw new Error('this replay needs a TagPro login and no session cookies were found — run with --login');
+  const api = await playwrightRequest.newContext({
+    extraHTTPHeaders: { Cookie: cookies.map(c => `${c.name}=${c.value}`).join('; ') },
+  });
+  try {
+    const res = await api.get(url, { maxRedirects: 0 });
+    if (!res.ok()) {
+      const why = (await res.text().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 160);
+      if (/logged in/i.test(why)) {
+        throw new Error('this replay is only served to logged-in users, and the Chrome profile the exporter reads ' +
+          'has no active TagPro login. Log into tagpro.koalabeast.com in Chrome, then rerun (or use --login)');
+      }
+      throw new Error(`HTTP ${res.status()} downloading ${url}${why ? ` — server says: "${why}"` : ''}`);
+    }
+    writeFileSync(destPath, await res.body());
+  } finally {
+    await api.dispose();
+  }
+  return destPath;
+}
+
 // Resolves a tagpro.eu match ID → { ndjsonPath, replayKey }
 // Downloads the NDJSON directly from TagPro's server (no local recording needed).
 async function lookupMatch(matchId) {
@@ -674,27 +298,51 @@ async function lookupMatch(matchId) {
   if (!game?.id) throw new Error(`No replay data found for UUID ${uuid}`);
   console.log(`  game.id: ${game.id}`);
 
-  const ndjsonUrl  = `https://tagpro.koalabeast.com/replays/gameFile?gameId=${game.id}`;
+  // Ask for the file the way TagPro's own replay viewer does: by replay key.  The
+  // gameId form of this endpoint is refused for some games that the key form serves
+  // to anyone, so it is only the second choice.  A login is the last resort.
+  const replayKey  = hexToBase64(game.id);
+  const base       = 'https://tagpro.koalabeast.com/replays/gameFile';
+  const urls       = [`${base}?key=${encodeURIComponent(replayKey)}`, `${base}?gameId=${game.id}`];
   const ndjsonPath = `/tmp/tagpro-match-${matchId}.ndjson`;
   console.log(`  Downloading NDJSON...`);
-  await downloadFile(ndjsonUrl, ndjsonPath);
+  let lastErr;
+  for (const url of urls) {
+    try { await downloadFile(url, ndjsonPath); lastErr = null; break; }
+    catch (err) { lastErr = err; }
+  }
+  if (lastErr) {
+    if (!/HTTP 40[13]\b/.test(lastErr.message)) throw lastErr;
+    console.log('  Replay file was refused without a login; retrying with your TagPro session...');
+    await downloadFileWithSession(urls[0], ndjsonPath);
+  }
 
-  return { ndjsonPath, replayKey: hexToBase64(game.id) };
+  return { ndjsonPath, replayKey };
 }
 
 // ── In-page recording function ─────────────────────────────────────────────
-// Seek to sliderMs, wait for the seek to land, play for durationMs while
-// capturing the canvas via MediaRecorder.  POV is set inside the 500 ms
-// settle window (after rp.play) so tagpro.players reflects the seek position.
+// Everything is timed off the replay's own clock (the seek bar's value, in ms)
+// rather than wall-clock timers: seek a little before the clip, let playback run
+// up to sliderMs, start capturing exactly there, stop at sliderMs + durationMs.
+//
+// pov is [{ atMs, name, pan }].  The first entry is applied before capture starts.
+// Later entries fire when the replay reaches sliderMs + atMs; with pan they use
+// TagPro's own eased camera move, so the next capper is brought to centre smoothly.
 const RECORDER_SRC = String.raw`
-window.__tpRecord = (sliderMs, durationMs, targetW, targetH, bitrateMbps, focusPlayer, prevFocusPlayer, povSwitchMs) =>
+window.__tpRecord = (sliderMs, durationMs, targetW, targetH, bitrateMbps, pov) =>
   new Promise((resolve, reject) => {
     const log = m => console.log('[tp-export] ' + m);
     const rp  = window.tagpro?.replayPlayer;
-    if (!rp) { reject('tagpro.replayPlayer not found'); return; }
+    const bar = document.getElementById('replaySeekBar');
+    if (!rp)  { reject('tagpro.replayPlayer not found'); return; }
+    if (!bar) { reject('#replaySeekBar not found'); return; }
+    const now = () => parseInt(bar.value, 10) || 0;
 
-    rp.seek(sliderMs);
-    log('seeking to ' + sliderMs + 'ms');
+    // Playback keeps running through the seek guard and POV set-up, so land early.
+    const PREROLL_MS = 1200;
+    const seekTo = Math.max(0, sliderMs - PREROLL_MS);
+    rp.seek(seekTo);
+    log('seeking to ' + seekTo + 'ms (clip starts at ' + sliderMs + 'ms)');
 
     const seekStart = Date.now();
     // 200 ms guard: on the first seek rp.seeking can flip false before our poll tick
@@ -707,96 +355,140 @@ window.__tpRecord = (sliderMs, durationMs, targetW, targetH, bitrateMbps, focusP
       waitForSeek();
     }, 200);
 
-    const setPov = (name) => {
-      if (!name || !window.tagpro?.players) return;
-      const entry = Object.entries(tagpro.players).find(([,p]) => p.name === name);
-      if (entry) {
-        tagpro.playerId = parseInt(entry[0]);
-        if (tagpro.viewport) tagpro.viewport.followPlayer = true;
-        log('POV → ' + name + ' (id=' + entry[0] + ')');
-      } else {
-        const available = Object.values(tagpro.players).map(p => p.name).join(', ');
+    // A player who rejoined has two entries under one name; the newest id is the live one.
+    const idOf = name => {
+      const ids = Object.entries(tagpro.players || {})
+        .filter(([, p]) => p.name === name).map(([id]) => parseInt(id));
+      return ids.length ? Math.max(...ids) : null;
+    };
+
+    const setPov = (name, pan) => {
+      const id = idOf(name);
+      if (id == null) {
+        const available = Object.values(tagpro.players || {}).map(p => p.name).join(', ');
         log('POV MISS: "' + name + '" — available: [' + available + ']');
+        return;
       }
+      if (tagpro.viewport) {
+        tagpro.viewport.followPlayer = true;
+        if (pan && id !== tagpro.playerId) {
+          // With pan set, TagPro eases the camera to the new player over 750 ms;
+          // centerLock off makes the glide track them while they move.
+          tagpro.viewport.centerLock = false;
+          tagpro.viewport.pan = true;
+          setTimeout(() => { tagpro.viewport.centerLock = true; }, 1000);
+        }
+      }
+      tagpro.playerId = id;
+      log('POV ' + (pan ? 'pan' : 'snap') + ' → ' + name + ' (id=' + id + ') at ' + now() + 'ms');
     };
 
     const onSeekComplete = () => {
-      log('seek complete, resuming playback');
+      log('seek complete at ' + now() + 'ms, resuming playback');
       rp.play();
 
-      // 500 ms settle: game is running and tagpro.players reflects the seek position.
-      // If this clip follows another, start with the previous clip's focal player so
-      // the dissolve transition blends two views of the same map location.  Switch to
-      // the new focal player at povSwitchMs (≈ mid-dissolve) when the 50/50 blend
-      // masks the camera snap.
-      setTimeout(() => {
-        const startPov = prevFocusPlayer || focusPlayer;
-        setPov(startPov);
+      const src = document.getElementById('viewport');
+      if (!src) { reject('#viewport canvas not found'); return; }
 
-        if (prevFocusPlayer && focusPlayer && prevFocusPlayer !== focusPlayer && povSwitchMs > 0) {
-          setTimeout(() => setPov(focusPlayer), povSwitchMs);
+      const w   = targetW || src.width  || 1280;
+      const h   = targetH || src.height || 720;
+      const rc  = document.createElement('canvas');
+      rc.width  = w; rc.height = h;
+      const ctx = rc.getContext('2d');
+      ctx.globalCompositeOperation = 'copy';
+
+      // TagPro's canvas is 16:10 (1280x800 native, scaled to fit the window), so
+      // stretching it onto a 16:9 frame squashes everything by ~11%.  Instead take
+      // a same-aspect crop: centred horizontally, anchored to the bottom so the
+      // score/clock HUD stays and the FPS/ping readout at the top is what goes.
+      const scale = Math.max(w / src.width, h / src.height);
+      const sw = Math.round(w / scale), sh = Math.round(h / scale);
+      const sx = Math.round((src.width - sw) / 2), sy = src.height - sh;
+
+      const mimeType = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm']
+        .find(t => MediaRecorder.isTypeSupported(t));
+      if (!mimeType) { reject('No supported MediaRecorder MIME type'); return; }
+
+      const mr = new MediaRecorder(rc.captureStream(60), {
+        mimeType,
+        videoBitsPerSecond: (bitrateMbps || 8) * 1_000_000,
+      });
+      const chunks = [];
+      let rafId;
+      mr.ondataavailable = e => e.data.size && chunks.push(e.data);
+      mr.onstop = () => {
+        cancelAnimationFrame(rafId);
+        rp.pause();
+        const blob = new Blob(chunks, { type: mimeType });
+        const ext  = mimeType.includes('mp4') ? 'mp4' : 'webm';
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href = url; a.download = 'tpclip_' + Date.now() + '.' + ext;
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 3000);
+        log('done — ' + chunks.length + ' chunks, ext=' + ext);
+        resolve(ext);
+      };
+
+      const pending   = (pov || []).filter(p => p && p.name).sort((a, b) => a.atMs - b.atMs);
+      const playStart = performance.now();
+      let povReady = pending.length === 0, framesOnPov = 0;
+      let recording = false, recStart = 0, lastDraw = 0;
+
+      // The seek bar stops reporting at its rounded max, a little before the replay's
+      // true end.  A clip that runs to the end of the game (a game-winning cap) would
+      // never see its end time on the bar, so once the bar is pinned the rest of the
+      // clip is timed on the wall clock.
+      const planEnd = sliderMs + durationMs;
+      const barMax  = parseInt(bar.max, 10) || Infinity;
+      let lastT = -1, lastAdvance = performance.now(), pinnedAt = null;
+
+      const tick = ts => {
+        const t = now();
+        if (t !== lastT) { lastT = t; lastAdvance = performance.now(); }
+
+        // First POV: as soon as the player is in the roster; give up waiting at the clip start.
+        if (!povReady) {
+          if (idOf(pending[0].name) != null || t >= sliderMs) {
+            setPov(pending.shift().name, false);
+            povReady = true;
+          }
+        } else if (!recording) {
+          framesOnPov++;
         }
 
-        const src = document.getElementById('viewport');
-        if (!src) { reject('#viewport canvas not found'); return; }
+        if (ts - lastDraw >= 1000 / 60) { ctx.drawImage(src, sx, sy, sw, sh, 0, 0, w, h); lastDraw = ts; }
 
-        const w   = targetW || src.width  || 1280;
-        const h   = targetH || src.height || 720;
-        const rc  = document.createElement('canvas');
-        rc.width  = w; rc.height = h;
-        const ctx = rc.getContext('2d');
-        ctx.globalCompositeOperation = 'copy';
-
-        // TagPro's canvas is 16:10 (1280x800 native, scaled to fit the window), so
-        // stretching it onto a 16:9 frame squashes everything by ~11%.  Instead take
-        // a same-aspect crop: centred horizontally, anchored to the bottom so the
-        // score/clock HUD stays and the FPS/ping readout at the top is what goes.
-        const scale = Math.max(w / src.width, h / src.height);
-        const sw = Math.round(w / scale), sh = Math.round(h / scale);
-        const sx = Math.round((src.width - sw) / 2), sy = src.height - sh;
-        log('canvas ' + src.width + 'x' + src.height + ' → crop ' + sw + 'x' + sh + ' at (' + sx + ',' + sy + ') → ' + w + 'x' + h);
-
-        let lastTs = 0, rafId;
-        const copyFrame = ts => {
-          if (ts - lastTs >= 1000 / 60) { ctx.drawImage(src, sx, sy, sw, sh, 0, 0, w, h); lastTs = ts; }
-          rafId = requestAnimationFrame(copyFrame);
-        };
-        rafId = requestAnimationFrame(copyFrame);
-
-        const mimeType = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm']
-          .find(t => MediaRecorder.isTypeSupported(t));
-        if (!mimeType) { reject('No supported MediaRecorder MIME type'); return; }
-        log('mimeType: ' + mimeType);
-
-        const mr = new MediaRecorder(rc.captureStream(60), {
-          mimeType,
-          videoBitsPerSecond: (bitrateMbps || 8) * 1_000_000,
-        });
-        const chunks = [];
-        mr.ondataavailable = e => e.data.size && chunks.push(e.data);
-        mr.onstop = () => {
-          cancelAnimationFrame(rafId);
-          rp.pause();
-          const blob = new Blob(chunks, { type: mimeType });
-          const ext  = mimeType.includes('mp4') ? 'mp4' : 'webm';
-          const url  = URL.createObjectURL(blob);
-          const a    = document.createElement('a');
-          a.href = url; a.download = 'tpclip_' + Date.now() + '.' + ext;
-          document.body.appendChild(a); a.click();
-          setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 3000);
-          log('done — ' + chunks.length + ' chunks, ext=' + ext);
-          resolve(ext);
-        };
-
-        // Let the renderer draw two frames on the new POV before capturing, so the
-        // first recorded frame is already centred on the focal player.
-        requestAnimationFrame(() => requestAnimationFrame(() => {
+        // Start once the replay reaches the clip and the renderer has drawn the first POV.
+        if (!recording && povReady && framesOnPov >= 2 && t >= sliderMs) {
           mr.start(200);
-          log('recording started for ' + durationMs + 'ms');
-          setTimeout(() => { log('stopping'); mr.stop(); }, durationMs);
-        }));
+          recording = true; recStart = performance.now();
+          log('recording from ' + t + 'ms for ' + durationMs + 'ms');
+        }
+        if (!recording && performance.now() - playStart > 15000) {
+          reject('replay never reached the clip start (' + sliderMs + 'ms, at ' + t + 'ms)');
+          return;
+        }
 
-      }, 500); // settle after play()
+        if (recording) {
+          while (pending.length && t >= sliderMs + pending[0].atMs) {
+            const p = pending.shift();
+            setPov(p.name, p.pan !== false);
+          }
+          const pinned = t >= barMax;
+          if (pinned && pinnedAt == null) pinnedAt = performance.now();
+          const done    = t >= planEnd || (pinned && performance.now() - pinnedAt >= planEnd - barMax);
+          // A replay that stops advancing mid-way has stalled; the wall-clock limit is a last resort.
+          const stalled = !pinned && performance.now() - lastAdvance > 400;
+          if (done || stalled || performance.now() - recStart > durationMs + 3000) {
+            log('stopping at ' + t + 'ms' + (done ? (pinned ? ' (end of replay)' : '') : stalled ? ' (replay stalled)' : ' (wall-clock limit)'));
+            mr.stop();
+            return;
+          }
+        }
+        rafId = requestAnimationFrame(tick);
+      };
+      rafId = requestAnimationFrame(tick);
     };
   });
 `;
@@ -831,6 +523,7 @@ async function resolveGames() {
   if (MLTP) {
     console.log(`\nFetching MLTP matchup ${MLTP} ...`);
     const m = await fetchMatchup(MLTP);
+    await downloadTeamLogos(m, resolve('./output/logos'));
     console.log(`  ${describeMatchup(m)}`);
     console.log(`  ${m.home.name} (${m.home.abbreviation}) vs ${m.away.name} (${m.away.abbreviation}) — best of ${m.bestOf}`);
     const games = [];
@@ -971,6 +664,8 @@ function printPlan(games, plan, budgetSec) {
       const sStart = g.gameStartMs + c.startMs, sEnd = g.gameStartMs + c.endMs;
       console.log(`  [${i + 1}] ${c.description}`);
       console.log(`       players: ${c.players.join(', ')}  |  slider: ${sStart}–${sEnd}ms  (${((sEnd - sStart) / 1000).toFixed(0)}s)`);
+      if (c.povSchedule?.length > 1)
+        console.log(`       camera: ${c.povSchedule.map(s => `${s.player} @${(s.atMs / 1000).toFixed(1)}s`).join(' → ')}`);
     });
   }
   const budget = budgetSec != null ? ` (budget ${fmtSec(budgetSec)}, ${plan.dropped} candidate clip(s) dropped)` : '';
@@ -1005,17 +700,22 @@ async function openReplay(browser, context, replayKey, tagproCookies) {
     { timeout: 90_000 }
   );
   await page.evaluate(RECORDER_SRC);
+  // Surface the recorder's camera decisions (and misses) in the run log.
+  page.on('console', m => {
+    const t = m.text();
+    if (t.startsWith('[tp-export]') && /POV|never reached|timed out|end of replay|stalled|wall-clock/.test(t)) console.log(`    ${t.slice(12)}`);
+  });
   console.log('  TagPro loaded.');
   return page;
 }
 
 // Record one clip via the in-page MediaRecorder, save the download, return an MP4 path.
-async function recordClip(page, clipsDir, label, { sliderMs, durationMs, focal = null, prevFocal = null, povSwitchMs = 0 }) {
+async function recordClip(page, clipsDir, label, { sliderMs, durationMs, pov = [] }) {
   const downloadPromise = page.waitForEvent('download', { timeout: durationMs + 60_000 });
+  downloadPromise.catch(() => {});   // if the page goes away, the evaluate below reports it
   const ext = await page.evaluate(
-    ({ sliderMs, durationMs, focal, prevFocal, povSwitchMs }) =>
-      window.__tpRecord(sliderMs, durationMs, 1280, 720, 8, focal, prevFocal, povSwitchMs),
-    { sliderMs, durationMs, focal, prevFocal, povSwitchMs }
+    ({ sliderMs, durationMs, pov }) => window.__tpRecord(sliderMs, durationMs, 1280, 720, 8, pov),
+    { sliderMs, durationMs, pov }
   );
   const dl      = await downloadPromise;
   const rawPath = `${clipsDir}/${label}.${ext}`;
@@ -1059,6 +759,15 @@ async function recordGame(page, game) {
     const focal = clip.focalPlayer ?? clip.players[0];
     const label = clip.label;
 
+    // Camera plan: the clip's own schedule (one stop per capper), panning between stops.
+    let pov = (clip.povSchedule?.length ? clip.povSchedule : [{ atMs: 0, player: focal }])
+      .map(s => ({ atMs: s.atMs, name: s.player, pan: s.atMs > 0 }));
+    if (blendPov && prevFocal && prevFocal !== pov[0].name) {
+      pov = [{ atMs: 0, name: prevFocal, pan: false },
+             { atMs: povSwitchMs, name: pov[0].name, pan: false },
+             ...pov.slice(1).filter(s => s.atMs > povSwitchMs)];
+    }
+
     // --debug-clip: record only clip 1, from t=0 through the focal event,
     // so you can watch where the focal player is throughout the game start.
     const sliderMs   = (DEBUG_CLIP && i === 0) ? 0 : gameStartMs + clip.startMs;
@@ -1068,12 +777,12 @@ async function recordGame(page, game) {
     console.log(`  [${i + 1}/${clips.length}] ${clip.description}`);
     if (DEBUG_CLIP && i === 0)
       console.log(`    DEBUG: recording from t=0 → ${clipEndMs}ms (${(clipEndMs / 1000).toFixed(0)}s)`);
-    console.log(`    focal=${focal}  prevFocal=${prevFocal ?? '(none)'}  slider=${sliderMs}ms  dur=${(durationMs / 1000).toFixed(0)}s`);
+    console.log(`    camera: ${pov.map(s => `${s.name}@${(s.atMs / 1000).toFixed(1)}s`).join(' → ')}  |  slider=${sliderMs}ms  dur=${(durationMs / 1000).toFixed(0)}s`);
 
     try {
-      const path = await recordClip(page, clipsDir, label, { sliderMs, durationMs, focal, prevFocal, povSwitchMs });
+      const path = await recordClip(page, clipsDir, label, { sliderMs, durationMs, pov });
       game.clipPaths.push(path);
-      prevFocal = blendPov ? focal : null;
+      prevFocal = blendPov ? pov.at(-1).name : null;
       console.log(`    ✓ ${label}.mp4\n`);
     } catch (err) {
       console.error(`    ✗ ${label} failed: ${err.message}`);
@@ -1087,6 +796,19 @@ async function recordGame(page, game) {
 // ── Main ───────────────────────────────────────────────────────────────────
 console.log('\nTagPro Replay Clip Exporter');
 console.log('============================');
+
+// --login: sign in first, before anything reads the session cookies.
+if (LOGIN_MODE) {
+  console.log('\nOpening Chrome for TagPro login...');
+  execFileSync('open', ['https://tagpro.koalabeast.com/login']);
+  console.log('  Log in with your Google account in the Chrome window.');
+  console.log('  Press Enter once you\'re on the TagPro home page...\n');
+  await new Promise(resolve => {
+    process.stdin.resume();
+    process.stdin.once('data', () => { process.stdin.pause(); resolve(); });
+  });
+  console.log('Cookies will be read from Chrome\'s profile. Continuing...\n');
+}
 
 // 1. Resolve which games to export, then download/parse/score each one.
 const { series: mltpSeries, games: requested } = await resolveGames();
@@ -1113,17 +835,21 @@ const series = mltpSeries ?? (multi ? {
   allGames:    null,
 } : null);
 
-if (multi) {
-  for (const g of games) {
-    g.colors = teamColors(g, series);
-    g.homeAwayScore = homeAwayScore(g, g.colors);
-    // Let the per-game recap/scoreboard cards show full team names instead of red/blue abbreviations.
-    if (g.colors.home && g.meta) {
-      g.meta.teamNames = {
-        [g.colors.home]: series.home.name,
-        [g.colors.away]: series.away.name,
-      };
-    }
+// What the end-of-game scoreboard cards need beyond the replay itself.
+for (const g of games) {
+  g.cardExtras = { source: g.matchId ? `tagpro.eu #${g.matchId}` : '' };
+  if (!multi) continue;
+  g.colors = teamColors(g, series);
+  g.homeAwayScore = homeAwayScore(g, g.colors);
+  Object.assign(g.cardExtras, {
+    gameNumber: g.gameNumber,
+    totalGames: series.bestOf ?? games.length,
+    label:      mltpSeries ? series.label : '',
+    overtime:   mltpSeries ? !!g.overtime : undefined,   // otherwise judged from the game length
+  });
+  if (g.colors.home) {       // full names and logos, mapped to the colour each team played
+    g.cardExtras.teamNames = { [g.colors.home]: series.home.name,     [g.colors.away]: series.away.name };
+    g.cardExtras.teamLogos = { [g.colors.home]: series.home.logoPath, [g.colors.away]: series.away.logoPath };
   }
 }
 
@@ -1171,40 +897,9 @@ if (RESTITCH) {
 if (multi) mkdirSync(`${MATCH_DIR}/cards`, { recursive: true });
 
 if (!RESTITCH) {
-  // 4. Auth via cookie injection
-  //
-  // Instead of trying to launch Chrome with a debug port (blocked by macOS's
-  // singleton mechanism), we read TagPro's session cookies directly from
-  // Chrome's profile database and inject them into Playwright's own Chromium.
-
-  const COOKIES_PY = resolve(__dir, 'extract_chrome_cookies.py');
-
-  if (LOGIN_MODE) {
-    console.log('\nOpening Chrome for TagPro login...');
-    execFileSync('open', ['https://tagpro.koalabeast.com/login']);
-    console.log('  Log in with your Google account in the Chrome window.');
-    console.log('  Press Enter once you\'re on the TagPro home page...\n');
-    await new Promise(resolve => {
-      process.stdin.resume();
-      process.stdin.once('data', () => { process.stdin.pause(); resolve(); });
-    });
-    console.log('Cookies will be read from Chrome\'s profile. Continuing...\n');
-  }
-
-  console.log('\nReading TagPro cookies from Chrome profile...');
-  let tagproCookies = [];
-  try {
-    const raw    = execFileSync('python3', [COOKIES_PY], { encoding: 'utf8' });
-    const parsed = JSON.parse(raw);
-    if (parsed.error) {
-      console.error(`  Cookie extraction warning: ${parsed.error}`);
-    } else {
-      tagproCookies = parsed.cookies;
-      console.log(`  Found ${tagproCookies.length} cookie(s) for tagpro.koalabeast.com`);
-    }
-  } catch (err) {
-    console.error(`  Cookie extractor failed: ${err.message}`);
-  }
+  // 4. Auth: the TagPro session cookies from Chrome, injected into Playwright's Chromium.
+  console.log('');
+  const tagproCookies = getTagproCookies();
 
   // Launch Playwright's own Chromium (no system Chrome needed)
   console.log('Launching browser...');
@@ -1214,10 +909,20 @@ if (!RESTITCH) {
   if (tagproCookies.length > 0) await context.addCookies(tagproCookies);
 
   // 5. Record every game (one fresh tab per replay).
+  const browserGone = () => {
+    console.error('\nThe recording browser was closed, so recording stopped.');
+    console.error('Run the same command again to record, keeping that window open until it finishes.');
+    process.exit(1);
+  };
   for (const [i, g] of games.entries()) {
+    if (!browser.isConnected()) browserGone();
     console.log(`\n[Game ${g.gameNumber}] (${i + 1}/${games.length}) ${g.mapName || ''}`);
-    const page = await openReplay(browser, context, g.replayKey, tagproCookies);
+    const page = await openReplay(browser, context, g.replayKey, tagproCookies).catch(err => {
+      if (!browser.isConnected()) browserGone();
+      throw err;
+    });
     await recordGame(page, g);
+    if (!browser.isConnected()) browserGone();
     await page.close();
   }
   await browser.close();
@@ -1235,16 +940,12 @@ const seriesRows = !multi ? [] : (series.allGames ?? games).map(o => {
     overtime:   !!(o.overtime ?? g?.overtime),
   };
 });
-const seriesScoreAfter = rows => rows.reduce((s, r) => {
-  if (r.score) { if (r.score[0] > r.score[1]) s[0]++; else if (r.score[1] > r.score[0]) s[1]++; }
-  return s;
-}, [0, 0]);
 
 const seg = (path, kind) => ({ path, kind });
 
 // 6. Captions, per-game ending cards, per-game stitch.
 for (const g of games) {
-  const { clipsDir, meta, playerStats, finalScore } = g;
+  const { clipsDir, meta } = g;
   console.log(`\n[Game ${g.gameNumber}] Finishing...`);
 
   // Lower-third caption burned onto the opening seconds of each clip.
@@ -1253,25 +954,30 @@ for (const g of games) {
     const teamNames = { red: meta?.teams?.red?.name, blue: meta?.teams?.blue?.name };
     clipPaths = g.clips.map((c, i) => {
       const src = g.clipPaths[i];
-      const png = src.replace(/\.mp4$/, '.caption.png');
       const out = src.replace(/\.mp4$/, '.captioned.mp4');
-      renderCaptionPng(png, captionFor(c, { gameNumber: multi ? g.gameNumber : null, teamNames }));
-      burnCaption(src, png, out);
+      const items = captionsFor(c, { gameNumber: multi ? g.gameNumber : null, teamNames }).map((cap, k) => {
+        const png = src.replace(/\.mp4$/, `.caption${k ? `-${k + 1}` : ''}.png`);
+        renderCaptionPng(png, cap);
+        return { png, atSec: cap.atSec };
+      });
+      burnCaptions(src, items, out);
       return out;
     });
     console.log(`  ✓ captions burned onto ${clipPaths.length} clip(s)`);
   }
 
-  console.log('  Generating recap card (featured players)...');
-  makeRecapCard(`${clipsDir}/recap.png`, `${clipsDir}/recap.mp4`, meta, playerStats, finalScore);
+  console.log('  Generating team comparison card...');
+  const board = buildScoreboardData(g, g.cardExtras);
+  makeCompareCard(`${clipsDir}/recap.png`, `${clipsDir}/recap.mp4`, board, RECAP_SEC);
   console.log('  ✓ recap.mp4');
 
   let segments;
   if (multi) {
     // Multi-game reels open each game with a title card instead of the cold-open
-    // intro, and close with the recap card only (the full box score is skipped
-    // to keep the series reel tight).
-    const seriesScore = seriesScoreAfter(seriesRows.filter(r => r.gameNumber < g.gameNumber));
+    // intro, and close with the team comparison card only (the full box score is
+    // skipped to keep the series reel tight).
+    // Shown before this game's clips, so it covers earlier games only.
+    const seriesScore = seriesScoreEntering(seriesRows, g.gameNumber);
     makeGameTitleCard(`${clipsDir}/title.png`, `${clipsDir}/title.mp4`, {
       gameNumber: g.gameNumber, totalGames: series.bestOf ?? games.length,
       mapName: g.mapName, seriesScore, colors: g.colors,
@@ -1280,8 +986,8 @@ for (const g of games) {
     console.log('  ✓ title.mp4');
     segments = [seg(`${clipsDir}/title.mp4`, 'card'), ...clipPaths.map(p => seg(p, 'clip')), seg(`${clipsDir}/recap.mp4`, 'card')];
   } else {
-    console.log('  Generating full scoreboard card...');
-    makeSummaryCard(`${clipsDir}/scoreboard.png`, `${clipsDir}/scoreboard.mp4`, meta, playerStats, finalScore);
+    console.log('  Generating box score card...');
+    makeBoxScoreCard(`${clipsDir}/scoreboard.png`, `${clipsDir}/scoreboard.mp4`, board, SCOREBOARD_SEC);
     console.log('  ✓ scoreboard.mp4');
     segments = [seg(g.introPath, 'clip'), ...clipPaths.map(p => seg(p, 'clip')),
                 seg(`${clipsDir}/recap.mp4`, 'card'), seg(`${clipsDir}/scoreboard.mp4`, 'card')];

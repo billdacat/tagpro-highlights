@@ -12,6 +12,8 @@ from datetime import datetime
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from card_logos import paste_logo, readable
+
 F_DISPLAY = '/System/Library/Fonts/Supplemental/DIN Condensed Bold.ttf'
 F_UI      = '/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf'
 F_BODY    = '/System/Library/Fonts/Supplemental/Futura.ttc'
@@ -152,27 +154,35 @@ def fmt_date(iso):
 
 def card_intro(D, logo):
     home, away = D['home'], D['away']
-    hc = hex_to_rgb(home.get('colorHex'), CRED)
-    ac = hex_to_rgb(away.get('colorHex'), CBLUE)
+    hc = readable(hex_to_rgb(home.get('colorHex'), CRED))
+    ac = readable(hex_to_rgb(away.get('colorHex'), CBLUE))
     img = background(hc, ac)
     d = ImageDraw.Draw(img)
 
     label_line(d, D.get('label', 'HIGHLIGHTS').upper(), 42)
 
-    # "VS" block
+    # Team logos (when the matchup provides them) sit over the names.
+    hx, ax = W // 4 + 10, 3 * W // 4 - 10
+    has_h = paste_logo(img, home.get('logoPath'), hx, 196, 210)
+    has_a = paste_logo(img, away.get('logoPath'), ax, 196, 210)
+    d = ImageDraw.Draw(img)
+    logos = has_h or has_a
+    name_y = 356 if logos else 300
+
     fvs = load_font(60, 'display')
-    draw_centered(d, 'VS', fvs, CD, W // 2, 300)
+    draw_centered(d, 'VS', fvs, CD, W // 2, 196 if logos else 300)
 
     half = W // 2 - 120
-    team_name(d, home['name'], hc, W // 4 + 10, 300, half - 40)
-    team_name(d, away['name'], ac, 3 * W // 4 - 10, 300, half - 40)
+    team_name(d, home['name'], hc, hx, name_y, half - 40, (60, 54, 48, 40, 34, 28))
+    team_name(d, away['name'], ac, ax, name_y, half - 40, (60, 54, 48, 40, 34, 28))
 
-    fab = load_font(22, 'ui')
-    draw_centered(d, home.get('abbreviation', ''), fab, CD, W // 4 + 10, 358)
-    draw_centered(d, away.get('abbreviation', ''), fab, CD, 3 * W // 4 - 10, 358)
+    fab = load_font(20, 'ui')
+    draw_centered(d, home.get('abbreviation', ''), fab, CD, hx, name_y + 54)
+    draw_centered(d, away.get('abbreviation', ''), fab, CD, ax, name_y + 54)
 
+    base = 500 if logos else 445
     fh = load_font(30, 'display')
-    draw_centered(d, 'HIGHLIGHT  REEL', fh, CW, W // 2, 445)
+    draw_centered(d, 'HIGHLIGHT  REEL', fh, CW, W // 2, base)
     sub = []
     if D.get('bestOf'):
         sub.append(f"BEST OF {D['bestOf']}")
@@ -180,55 +190,54 @@ def card_intro(D, logo):
     if date:
         sub.append(date.upper())
     if sub:
-        draw_dotted(d, ' · '.join(sub), load_font(16, 'ui'), CD, W // 2, 488)
+        draw_dotted(d, ' · '.join(sub), load_font(16, 'ui'), CD, W // 2, base + 42)
 
-    d.rectangle([(W // 2 - 120, 528), (W // 2 + 120, 530)], fill=CL)
+    d.rectangle([(W // 2 - 120, base + 80), (W // 2 + 120, base + 82)], fill=CL)
     footer(img, d, logo, D.get('footer', ''))
     return img
 
 
 def card_game(D, logo):
     home, away = D['home'], D['away']
-    hc = hex_to_rgb(home.get('colorHex'), CRED)
-    ac = hex_to_rgb(away.get('colorHex'), CBLUE)
+    # This card introduces one game, so the teams wear the colours they play in it:
+    # names, side rails and wash are in-game red/blue.  That tells the viewer who is
+    # who in the footage without a separate line of text.  If the colours are not
+    # known, fall back to the teams' own colours.
+    in_game = {'red': CRED, 'blue': CBLUE}
+    colors = D.get('colors') or {}
+    hc = in_game.get(colors.get('home')) or readable(hex_to_rgb(home.get('colorHex'), CRED))
+    ac = in_game.get(colors.get('away')) or readable(hex_to_rgb(away.get('colorHex'), CBLUE))
     img = background(hc, ac)
     d = ImageDraw.Draw(img)
+    dy = 30                                   # vertical centring of the whole block
 
+    # Game number is the headline, so nobody mistakes which game the card introduces.
     n, total = D.get('gameNumber', 1), D.get('totalGames', 1)
-    label_line(d, f'GAME  {n}  OF  {total}', 42)
+    fg = load_font(104, 'display')
+    draw_centered(d, f'GAME {n}', fg, CG, W // 2, 98 + dy)          # flat: no outline or shadow
+    gw = text_size(d, f'GAME {n}', fg)[0]
+    d.rectangle([(40, 97 + dy), (W // 2 - gw // 2 - 28, 98 + dy)], fill=CL)
+    d.rectangle([(W // 2 + gw // 2 + 28, 97 + dy), (W - 40, 98 + dy)], fill=CL)
+    draw_centered(d, f'OF  {total}', load_font(16, 'ui'), CD, W // 2, 166 + dy)
 
-    # Map name, huge
+    # Map name
     map_name = (D.get('mapName') or 'TagPro').upper()
-    fm = fit_font(d, map_name, 'display', W - 200, (150, 130, 110, 90, 70))
-    draw_centered(d, map_name, fm, CW, W // 2 + 3, 233, stroke_width=3, stroke_fill=(0, 0, 0))
-    draw_centered(d, map_name, fm, CW, W // 2, 230)
-    draw_centered(d, 'MAP', load_font(14, 'ui'), CD, W // 2, 318)
+    fm = fit_font(d, map_name, 'display', W - 240, (118, 104, 90, 76, 62))
+    draw_centered(d, map_name, fm, CW, W // 2, 280 + dy)             # flat, like the heading
+    draw_centered(d, 'MAP', load_font(14, 'ui'), CD, W // 2, 356 + dy)
 
-    # Series score entering this game
+    # Series score ENTERING this game: results of earlier games only, never this one.
     ss = D.get('seriesScore') or [0, 0]
     fss = load_font(84, 'display')
-    draw_centered(d, f'{ss[0]}  –  {ss[1]}', fss, CW, W // 2, 420)
-    draw_centered(d, 'SERIES', load_font(14, 'ui'), CD, W // 2, 476)
-    team_name(d, home['name'], hc, W // 4 - 20, 420, W // 2 - 220, (44, 38, 32, 28, 24))
-    team_name(d, away['name'], ac, 3 * W // 4 + 20, 420, W // 2 - 220, (44, 38, 32, 28, 24))
-
-    # Which in-game colour each team plays
-    colors = D.get('colors') or {}
-    y = 560
-    fchip = load_font(18, 'ui')
-    chips = []
-    for side, team in (('home', home), ('away', away)):
-        c = colors.get(side)
-        if c in ('red', 'blue'):
-            chips.append((CRED if c == 'red' else CBLUE, f"{team['name']}  plays  {c.upper()}"))
-    if chips:
-        widths = [text_size(d, t, fchip)[0] + 40 for _, t in chips]
-        total_w = sum(widths) + 60 * (len(chips) - 1)
-        x = W // 2 - total_w // 2
-        for (col, t), cw in zip(chips, widths):
-            d.ellipse([x, y - 9, x + 18, y + 9], fill=col, outline=(10, 10, 28), width=2)
-            d.text((x + 30, y - text_size(d, t, fchip)[1] // 2 - text_size(d, t, fchip)[2][1]), t, font=fchip, fill=CW)
-            x += cw + 60
+    draw_centered(d, f'{ss[0]}  \u2013  {ss[1]}', fss, CW, W // 2, 470 + dy)
+    series_label = 'SERIES' if n <= 1 else f'SERIES  AFTER  GAME  {n - 1}'
+    draw_centered(d, series_label, load_font(14, 'ui'), CD, W // 2, 528 + dy)
+    has_h = paste_logo(img, home.get('logoPath'), W // 4 - 20, 412 + dy, 92)
+    has_a = paste_logo(img, away.get('logoPath'), 3 * W // 4 + 20, 412 + dy, 92)
+    d = ImageDraw.Draw(img)
+    ny = (494 if (has_h or has_a) else 470) + dy
+    team_name(d, home['name'], hc, W // 4 - 20, ny, W // 2 - 220, (44, 40, 36, 32, 28, 24))
+    team_name(d, away['name'], ac, 3 * W // 4 + 20, ny, W // 2 - 220, (44, 40, 36, 32, 28, 24))
 
     footer(img, d, logo, D.get('footer', ''))
     return img
@@ -236,8 +245,8 @@ def card_game(D, logo):
 
 def card_final(D, logo):
     home, away = D['home'], D['away']
-    hc = hex_to_rgb(home.get('colorHex'), CRED)
-    ac = hex_to_rgb(away.get('colorHex'), CBLUE)
+    hc = readable(hex_to_rgb(home.get('colorHex'), CRED))
+    ac = readable(hex_to_rgb(away.get('colorHex'), CBLUE))
     img = background(hc, ac)
     d = ImageDraw.Draw(img)
 
@@ -245,15 +254,21 @@ def card_final(D, logo):
 
     ss = D.get('seriesScore') or [0, 0]
     fss = load_font(120, 'display')
-    draw_centered(d, f'{ss[0]}  –  {ss[1]}', fss, CW, W // 2 + 3, 175, stroke_width=3, stroke_fill=(0, 0, 0))
-    draw_centered(d, f'{ss[0]}  –  {ss[1]}', fss, CW, W // 2, 172)
+    draw_centered(d, f'{ss[0]}  –  {ss[1]}', fss, CW, W // 2, 172)     # flat: no outline or shadow
 
-    team_name(d, home['name'], hc, W // 4 - 30, 172, W // 2 - 260, (52, 46, 40, 34, 28))
-    team_name(d, away['name'], ac, 3 * W // 4 + 30, 172, W // 2 - 260, (52, 46, 40, 34, 28))
+    has_h = paste_logo(img, home.get('logoPath'), W // 4 - 30, 122, 96)
+    has_a = paste_logo(img, away.get('logoPath'), 3 * W // 4 + 30, 122, 96)
+    d = ImageDraw.Draw(img)
+    logos = has_h or has_a
+    ny = 202 if logos else 172
+    sizes = (40, 36, 32, 28, 24) if logos else (52, 46, 40, 34, 28)
+    team_name(d, home['name'], hc, W // 4 - 30, ny, W // 2 - 260, sizes)
+    team_name(d, away['name'], ac, 3 * W // 4 + 30, ny, W // 2 - 260, sizes)
+    uy = ny + (32 if logos else 42)
     if ss[0] > ss[1]:
-        d.rectangle([(W // 4 - 30 - 70, 214), (W // 4 - 30 + 70, 217)], fill=hc)
+        d.rectangle([(W // 4 - 30 - 70, uy), (W // 4 - 30 + 70, uy + 3)], fill=hc)
     elif ss[1] > ss[0]:
-        d.rectangle([(3 * W // 4 + 30 - 70, 214), (3 * W // 4 + 30 + 70, 217)], fill=ac)
+        d.rectangle([(3 * W // 4 + 30 - 70, uy), (3 * W // 4 + 30 + 70, uy + 3)], fill=ac)
 
     d.rectangle([(200, 262), (W - 200, 263)], fill=CL)
 

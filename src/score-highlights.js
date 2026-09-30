@@ -8,6 +8,8 @@ const EVENT_SCORES = {
 
 const PRE_RADIUS_MS  = 8000;
 const POST_RADIUS_MS = 2000;
+const POST_CAP_RADIUS_MS    = 1000;  // a cap needs less tail: the play is over once the score ticks
+const POV_HOLD_AFTER_CAP_MS = 1000;  // multi-cap clips: stay on a capper this long before moving on
 const MERGE_GAP_MS   = 2000;
 const MIN_NON_CAP_SCORE = 5; // non-cap windows must clear this to be included
 
@@ -49,7 +51,8 @@ export function scoreHighlights({ events, playerIndex, meta, gameStartMs, actual
 
   const candidates = scored.map(focal => {
     const start = Math.max(0, focal.gameTime - PRE_RADIUS_MS);
-    const end   = Math.min(gameDurationMs, focal.gameTime + POST_RADIUS_MS);
+    const post  = focal.type === 'capture' ? POST_CAP_RADIUS_MS : POST_RADIUS_MS;
+    const end   = Math.min(gameDurationMs, focal.gameTime + post);
 
     const windowEvents = scored.filter(e => e.gameTime >= start && e.gameTime <= end);
     let totalScore = windowEvents.reduce((s, e) => s + (EVENT_SCORES[e.type] ?? 0), 0);
@@ -150,7 +153,9 @@ export function scoreHighlights({ events, playerIndex, meta, gameStartMs, actual
 
   selected.sort((a, b) => a.start - b.start);
 
-  return selected.map((clip, i) => ({
+  return selected.map((clip, i) => {
+    const povSchedule = buildPovSchedule(clip);
+    return {
     index:       i + 1,
     start:       fmtMs(clip.start),
     end:         fmtMs(clip.end),
@@ -159,14 +164,37 @@ export function scoreHighlights({ events, playerIndex, meta, gameStartMs, actual
     score:       clip.totalScore,
     focalType:   clip.headline.type,
     focalTeam:   clip.headline.team,     // 1 = red, 2 = blue
-    focalPlayer: clip.focal.playerName,
+    focalPlayer: povSchedule[0].player,
+    povSchedule,
     players:     clip.players,
     scoreAtClip: clip.scoreAtClip,
     description: describe(clip.headline),
     events: clip.windowEvents.map(e =>
       `${fmtMs(e.gameTime).padEnd(6)} ${e.type.padEnd(10)} ${e.playerName}`
     ),
-  }));
+    };
+  });
+}
+
+// Who the camera follows, and when it moves.  A clip that holds several captures
+// follows each capper in turn: it stays on one until shortly after their cap, then
+// moves to the next.  Any other clip follows the player who makes its headline play,
+// which is also the player its caption names.  atMs is relative to the clip start.
+function buildPovSchedule(clip) {
+  const caps  = clip.windowEvents.filter(e => e.type === 'capture');
+  const stops = caps.length ? caps : [clip.headline];
+  const schedule = [];
+  stops.forEach((e, i) => {
+    const prev = stops[i - 1];
+    if (prev && prev.playerName === e.playerName) return;   // camera is already on them
+    let atMs = 0;
+    if (prev) {
+      const gap = e.gameTime - prev.gameTime;
+      atMs = Math.round(prev.gameTime - clip.start + Math.min(POV_HOLD_AFTER_CAP_MS, gap / 2));
+    }
+    schedule.push({ atMs, player: e.playerName, team: e.team, type: e.type, description: describe(e) });
+  });
+  return schedule;
 }
 
 function fmtMs(ms) {

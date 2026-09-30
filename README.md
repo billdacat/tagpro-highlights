@@ -13,7 +13,7 @@ The project has two independent rendering pipelines plus one experimental side t
 ## How it works (pipeline overview)
 
 1. **Parse** — `src/parse-replay.js` reads a TagPro NDJSON replay (one JSON event per line: player deltas, map state, score, game clock) and reconstructs cumulative player/game state.
-2. **Score & cluster** — `src/score-highlights.js` scores notable events (captures, returns, multi-tags, etc.) and clusters them into a handful of ~20–24s highlight windows.
+2. **Score & cluster** — `src/score-highlights.js` scores notable events (captures, returns, multi-tags, etc.) and clusters them into highlight windows: 8 s of build-up before the play, then 1 s after a capture or 2 s after anything else. Each clip also gets a camera schedule. A clip that holds several captures follows each capper in turn; any other clip follows the player who makes its headline play.
 3. **Export a manifest** — `src/export-manifest.js` writes `highlight-manifest.json` describing each clip (start/end time, players involved, description).
 4. **Render** — either:
    - `src/export-replay-clips.js` replays the game inside the real TagPro client (via an authenticated session) and screen-records each clip with `MediaRecorder`, or
@@ -58,6 +58,8 @@ You need a TagPro replay in NDJSON format (one JSON array per line: `[timestampM
 
 Note that replays only stay on `tagpro.koalabeast.com` for a limited time; a game whose replay has expired is skipped with a warning when exporting a series.
 
+Replay files are requested the same way TagPro's own replay viewer requests them (`/replays/gameFile?key=<replay key>`), which needs no login. If the server refuses that, the exporter retries with the TagPro session from your Chrome `Default` profile; if that profile has no active TagPro login the game is skipped, and the fix is to log into tagpro.koalabeast.com in Chrome and rerun (or use `--login`).
+
 ## Usage
 
 ### Real-renderer export (recommended)
@@ -82,7 +84,17 @@ node src/export-replay-clips.js [ndjsonPath] [flags]
 | `--debug-clip` | Record only the first clip, starting at t=0 — useful for debugging POV/timing issues without rendering the whole set. |
 | `--login` | Opens Chrome to `tagpro.koalabeast.com/login` so you can sign in, then waits for Enter before continuing. Use this the first time, or whenever your session has expired. |
 
-Output for a single game: `output/clips/clip_01.mp4 …` and a stitched `output/game-summary.mp4` (intro, highlights, recap card, full scoreboard).
+Output for a single game: `output/clips/clip_01.mp4 …` and a stitched `output/game-summary.mp4` (intro, highlights, team comparison card, box score).
+
+#### End-of-game scoreboards
+
+Every game closes on a **team comparison** card: the final score, each team's name and roster, and eight labelled stat bars (caps, grabs, hold, returns, tags, prevent, powerups, pops) with the better side lit. Single-game reels follow it with a **box score**: one row per player, with the best value in each column in gold. A player who reconnects mid-game appears once, with their stats added up.
+
+To look at the cards for a replay without recording anything:
+
+```bash
+node src/preview-scoreboards.js <replay.ndjson> [--mltp=<matchup> --game=N] [--out=DIR]
+```
 
 #### Series reels (MLTP matchups or several match IDs)
 
@@ -93,6 +105,8 @@ node src/export-replay-clips.js --match=4389828,4389843,4389859
 ```
 
 Each game is recorded in its own tab of the same logged-in browser, then the reel is assembled as: series intro card → for each game, a title card (map, series score so far, which colour each team plays), that game's captioned highlight clips hard-cut together, and its recap card → series final card with every game's score. Cards are separated from gameplay by a short dip to black. Team names and colours come from mltp.gg when available; with plain `--match` IDs they come from the replay's red/blue team names.
+
+With `--mltp`, both teams' logos are downloaded from the matchup page into `output/logos/` and shown on the series cards. Logos are used as uploaded: a transparent logo is trimmed and shown as it is, an opaque square one is shown as a rounded tile. A team colour that is close to black is lifted to a light neutral so the name stays readable on the dark cards.
 
 Output:
 
@@ -105,6 +119,12 @@ output/match-highlights.mp4           the full series reel
 ```
 
 Recording happens in real time, so a series reel with an 8-minute budget takes roughly 15–20 minutes to export.
+
+#### Camera and timing
+
+The recorder is timed off the replay's own clock (the seek bar's position in milliseconds), not wall-clock timers. It seeks slightly before the clip, lets playback run up to the clip's start, and captures exactly the planned window, so a capture lands where the plan says it does.
+
+When a clip contains two captures by different players, the camera stays on the first capper until a second after their cap, then glides to the next capper using TagPro's own eased camera pan. Each camera stop gets its own lower-third caption, shown when the camera arrives. Captures that are far enough apart are simply separate clips.
 
 #### Authentication / the `--login` flow
 
@@ -164,6 +184,9 @@ This tool is macOS-only end-to-end: `generate-audio.js` shells out to the built-
 | `src/mltp.js` | Resolves an mltp.gg matchup to its games and tagpro.eu match IDs |
 | `src/series-cards.js`, `src/series_cards.py` | Series intro, per-game title, series final cards, and the caption badge renderer |
 | `src/captions.js` | Builds each clip's lower-third caption and burns it in with ffmpeg |
+| `src/scoreboard-cards.js`, `src/scoreboard_cards.py` | End-of-game team comparison and box score cards |
+| `src/card_logos.py` | Team logo handling shared by the card renderers |
+| `src/preview-scoreboards.js` | Renders the scoreboard cards for a replay without recording |
 | `src/extract_chrome_cookies.py` | Reads/decrypts your local Chrome session cookie for TagPro auth |
 | `src/fetch-match.js` | Fetches match metadata from `tagpro.eu` |
 | `output/clips/` | Rendered clip videos (single game); series runs use `output/match/` |

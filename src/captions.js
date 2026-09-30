@@ -16,18 +16,23 @@ export const CAPTION = {
 
 const EVENT_LABEL = { capture: 'Capture', return: 'Return', tag: 'Tag', grab: 'Grab', drop: 'Drop' };
 
-// Build the caption for a clip.  Team words in the scorer's description ("Red"/"Blue")
-// are swapped for the team names the server recorded, which match the on-screen score bar.
-export function captionFor(clip, { gameNumber = null, teamNames = {} } = {}) {
+// Build the captions for a clip: one per camera stop, shown when the camera gets there.
+// A clip with two captures therefore names each capper in turn.  Team words in the
+// scorer's description ("Red"/"Blue") are swapped for the team names the server
+// recorded, which match the on-screen score bar.
+export function captionsFor(clip, { gameNumber = null, teamNames = {} } = {}) {
   const red  = teamNames.red  ?? 'Red';
   const blue = teamNames.blue ?? 'Blue';
-  const text = (clip.description ?? '')
-    .replace(/\bRed\b/g, red)
-    .replace(/\bBlue\b/g, blue);
-  const type  = EVENT_LABEL[clip.focalType] ?? clip.focalType ?? 'Highlight';
-  const label = gameNumber != null ? `Game ${gameNumber} · ${type}` : type;
-  const team  = clip.focalTeam === 1 ? 'red' : clip.focalTeam === 2 ? 'blue' : null;
-  return { label, text, team };
+  const stops = clip.povSchedule?.length
+    ? clip.povSchedule
+    : [{ atMs: 0, description: clip.description, type: clip.focalType, team: clip.focalTeam }];
+  return stops.map(s => {
+    const text  = (s.description ?? '').replace(/\bRed\b/g, red).replace(/\bBlue\b/g, blue);
+    const type  = EVENT_LABEL[s.type] ?? s.type ?? 'Highlight';
+    const label = gameNumber != null ? `Game ${gameNumber} · ${type}` : type;
+    const team  = s.team === 1 ? 'red' : s.team === 2 ? 'blue' : null;
+    return { atSec: (s.atMs ?? 0) / 1000, label, text, team };
+  });
 }
 
 export function renderCaptionPng(pngPath, caption) {
@@ -35,21 +40,26 @@ export function renderCaptionPng(pngPath, caption) {
   return pngPath;
 }
 
-// Overlay the badge onto the clip and normalise to 30 fps (MediaRecorder output is VFR).
-export function burnCaption(clipPath, pngPath, outPath) {
+// Overlay the badges onto the clip and normalise to 30 fps (MediaRecorder output is VFR).
+// items: [{ png, atSec }] — each badge slides in at atSec, holds, and fades out.
+export function burnCaptions(clipPath, items, outPath) {
   const { x, y, delaySec, fadeInSec, holdSec, fadeOutSec } = CAPTION;
-  const endSec       = delaySec + fadeInSec + holdSec + fadeOutSec;
-  const fadeOutStart = endSec - fadeOutSec;
-  const slideX       = `${x}-28*(1-min(1,max(0,(t-${delaySec})/${fadeInSec})))`;
-  const filter = [
-    `[0:v]fps=30,setpts=PTS-STARTPTS[base]`,
-    `[1:v]format=rgba,fade=t=in:st=${delaySec}:d=${fadeInSec}:alpha=1,fade=t=out:st=${fadeOutStart}:d=${fadeOutSec}:alpha=1[cap]`,
-    `[base][cap]overlay=x='${slideX}':y=${y}:eof_action=pass[v]`,
-  ].join(';');
+  const lifeSec = fadeInSec + holdSec + fadeOutSec;
+  const inputs  = ['-i', clipPath];
+  const filters = ['[0:v]fps=30,setpts=PTS-STARTPTS[v0]'];
+  items.forEach((it, i) => {
+    const start  = +(it.atSec + delaySec).toFixed(3);
+    const slideX = `${x}-28*(1-min(1,max(0,(t-${start})/${fadeInSec})))`;
+    inputs.push('-loop', '1', '-framerate', '30', '-t', String(lifeSec + 0.1), '-i', it.png);
+    filters.push(
+      `[${i + 1}:v]format=rgba,fade=t=in:st=0:d=${fadeInSec}:alpha=1,` +
+      `fade=t=out:st=${fadeInSec + holdSec}:d=${fadeOutSec}:alpha=1,setpts=PTS+${start}/TB[c${i}]`,
+      `[v${i}][c${i}]overlay=x='${slideX}':y=${y}:eof_action=pass:enable='between(t,${start},${start + lifeSec})'[v${i + 1}]`,
+    );
+  });
   execFileSync('ffmpeg', [
-    '-y', '-i', clipPath,
-    '-loop', '1', '-framerate', '30', '-t', String(endSec + 0.1), '-i', pngPath,
-    '-filter_complex', filter, '-map', '[v]',
+    '-y', ...inputs,
+    '-filter_complex', filters.join(';'), '-map', `[v${items.length}]`,
     '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
     '-an', outPath,
   ]);
