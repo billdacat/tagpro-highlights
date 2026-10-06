@@ -135,6 +135,21 @@ export async function downloadTeamLogos(matchup, dir) {
   return matchup;
 }
 
+// One-off logo swaps for a single run.  overrides: [{ team, path }], where `team` is an
+// abbreviation (exact) or any part of a team name, case-insensitive.  Returns the
+// overrides that matched no team, so the caller can refuse to run with a typo.
+export function applyLogoOverrides(matchup, overrides) {
+  const unmatched = [];
+  for (const o of overrides) {
+    const want = o.team.trim().toLowerCase();
+    const t = [matchup.home, matchup.away].find(t => t &&
+      (t.abbreviation?.toLowerCase() === want || t.name?.toLowerCase().includes(want)));
+    if (t) { t.logoPath = o.path; t.logoOverridden = true; }
+    else unmatched.push(o);
+  }
+  return unmatched;
+}
+
 // Human-readable one-liner, e.g. "MLTP Majors · Season 40 · Week 3"
 export function describeMatchup(m) {
   const parts = ['MLTP'];

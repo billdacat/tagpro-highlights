@@ -6,7 +6,8 @@ Uses only built-in Python + macOS system tools (security, openssl). No pip neede
 import hashlib, json, os, shutil, sqlite3, subprocess, sys, tempfile
 
 CHROME_DATA  = os.path.expanduser('~/Library/Application Support/Google/Chrome')
-COOKIES_PATH = os.path.join(CHROME_DATA, 'Default', 'Cookies')
+PROFILE      = sys.argv[1] if len(sys.argv) > 1 else 'Default'   # e.g. "Profile 1"
+COOKIES_PATH = os.path.join(CHROME_DATA, PROFILE, 'Cookies')
 TARGET       = 'tagpro.koalabeast.com'
 
 def get_key():

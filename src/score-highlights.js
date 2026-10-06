@@ -12,8 +12,9 @@ const POST_CAP_RADIUS_MS    = 1000;  // a cap needs less tail: the play is over 
 const POV_HOLD_AFTER_CAP_MS = 1000;  // multi-cap clips: stay on a capper this long before moving on
 const MERGE_GAP_MS   = 2000;
 const MIN_NON_CAP_SCORE = 5; // non-cap windows must clear this to be included
+const LONG_CARRY_MS  = 6000; // a flag carry this long that did not score is a near-miss worth showing
 
-export function scoreHighlights({ events, playerIndex, meta, gameStartMs, actualDurationMs, maxNonCapClips = 5 }) {
+export function scoreHighlights({ events, playerIndex, meta, gameStartMs, actualDurationMs, maxNonCapClips = 30 }) {
   const regulationMs   = typeof meta?.duration === 'number' ? meta.duration : null;
   const gameDurationMs = actualDurationMs ?? regulationMs ?? Infinity;
   const scored = events.filter(e => EVENT_SCORES[e.type] > 0);
@@ -21,18 +22,21 @@ export function scoreHighlights({ events, playerIndex, meta, gameStartMs, actual
 
   // ── Pre-computation ────────────────────────────────────────────────────────
 
-  // How each grab resolved: hold duration and whether it ended in a cap.
-  // Used to penalise panic grabs (grabbed and immediately returned/popped).
+  // How each grab resolved: hold duration and whether it ended in a cap.  Used to
+  // penalise panic grabs, to score long carries, and to rate returns by what they stopped.
   const grabOutcome = new Map(); // grab.ts → { holdMs, capped }
-  const inFlight = {};           // playerId → ts of their active grab
+  const dropsAt     = new Map(); // ts → [{ team, playerName, holdMs, wasPopped }] for drops at that instant
+  const inFlight    = {};        // playerId → ts of their active grab
   for (const e of events) {
     if (e.type === 'grab') {
       inFlight[e.playerId] = e.ts;
     } else if ((e.type === 'capture' || e.type === 'drop') && inFlight[e.playerId] != null) {
-      grabOutcome.set(inFlight[e.playerId], {
-        holdMs: e.ts - inFlight[e.playerId],
-        capped: e.type === 'capture',
-      });
+      const holdMs = e.ts - inFlight[e.playerId];
+      grabOutcome.set(inFlight[e.playerId], { holdMs, capped: e.type === 'capture' });
+      if (e.type === 'drop') {
+        if (!dropsAt.has(e.ts)) dropsAt.set(e.ts, []);
+        dropsAt.get(e.ts).push({ team: e.team, playerName: e.playerName, holdMs, wasPopped: !!e.data?.wasPopped, event: e });
+      }
       delete inFlight[e.playerId];
     }
   }
@@ -47,63 +51,90 @@ export function scoreHighlights({ events, playerIndex, meta, gameStartMs, actual
       carryMs.set(e.ts, e.ts - lastGrab[e.playerId]);
   }
 
-  // ── Build candidates ───────────────────────────────────────────────────────
-
-  const candidates = scored.map(focal => {
-    const start = Math.max(0, focal.gameTime - PRE_RADIUS_MS);
-    const post  = focal.type === 'capture' ? POST_CAP_RADIUS_MS : POST_RADIUS_MS;
-    const end   = Math.min(gameDurationMs, focal.gameTime + post);
-
+  // A clip window around a focal event: everything scored inside it, with the
+  // panic-grab penalty applied.  The focal event is also the headline, so the
+  // camera and caption follow the player who made the play.
+  const windowAt = (focal, start, end) => {
     const windowEvents = scored.filter(e => e.gameTime >= start && e.gameTime <= end);
     let totalScore = windowEvents.reduce((s, e) => s + (EVENT_SCORES[e.type] ?? 0), 0);
-
-    // Penalty: grabs that were returned/popped within 3.5 s without capping.
-    // These are panic grabs — they inflate event counts without adding drama.
     for (const e of windowEvents) {
       if (e.type !== 'grab') continue;
       const outcome = grabOutcome.get(e.ts);
       if (outcome && !outcome.capped && outcome.holdMs < 3500) totalScore -= 2;
     }
+    return {
+      focal, headline: focal, start, end, totalScore, windowEvents,
+      hasCapture:  focal.type === 'capture',
+      players:     [...new Set(windowEvents.map(e => e.playerName).filter(Boolean))],
+      scoreAtClip: windowEvents.at(-1)?.score ?? focal.score,
+    };
+  };
+
+  // ── Capture windows ────────────────────────────────────────────────────────
+
+  const capCandidates = scored.filter(e => e.type === 'capture').map(focal => {
+    const c = windowAt(focal,
+      Math.max(0, focal.gameTime - PRE_RADIUS_MS),
+      Math.min(gameDurationMs, focal.gameTime + POST_CAP_RADIUS_MS));
 
     // Bonus: cap with a genuine carry (player held flag ≥ 5 s = ran it across the map).
-    if (focal.type === 'capture') {
-      const carry = carryMs.get(focal.ts);
-      if (carry != null && carry >= 5000) totalScore += 5;
-    }
+    const carry = carryMs.get(focal.ts);
+    if (carry != null && carry >= 5000) c.totalScore += 5;
 
     // Bonus: captures that change or tie the lead.
-    for (const cap of windowEvents.filter(e => e.type === 'capture')) {
+    for (const cap of c.windowEvents.filter(e => e.type === 'capture')) {
       const { r, b } = cap.score;
       const mine = cap.team === 1 ? r : b;
       const theirs = cap.team === 1 ? b : r;
-      if (mine === theirs)    totalScore += 5; // tie game
-      else if (mine > theirs) totalScore += 3; // take the lead
+      if (mine === theirs)    c.totalScore += 5; // tie game
+      else if (mine > theirs) c.totalScore += 3; // take the lead
     }
 
     // Overtime: a cap past regulation ends the game — always rank first.
-    if (regulationMs !== null && focal.type === 'capture' && focal.gameTime > regulationMs) {
-      totalScore += 25;
-    }
+    if (regulationMs !== null && focal.gameTime > regulationMs) c.totalScore += 25;
 
-    const headline = windowEvents.length > 0
-      ? windowEvents.reduce((best, e) =>
-          (EVENT_SCORES[e.type] ?? 0) > (EVENT_SCORES[best.type] ?? 0) ? e : best)
-      : focal;
-
-    return {
-      focal, headline, start, end, totalScore,
-      hasCapture:    focal.type === 'capture',
-      players:       [...new Set(windowEvents.map(e => e.playerName).filter(Boolean))],
-      windowEvents,
-      scoreAtClip:   windowEvents.at(-1)?.score ?? focal.score,
-    };
+    // Headline: the highest-scoring event in the window (a capture).
+    c.headline = c.windowEvents.reduce((best, e) =>
+      (EVENT_SCORES[e.type] ?? 0) > (EVENT_SCORES[best.type] ?? 0) ? e : best, focal);
+    return c;
   });
 
-  // ── Merge adjacent windows ─────────────────────────────────────────────────
-  // Cap candidates merge only with other cap candidates, and non-cap candidates
-  // merge only with each other.  Mixing the two causes a cascade: a return or
-  // grab between two distant caps bridges their windows and collapses all caps
-  // into one enormous clip.  Separate passes prevent that.
+  // ── Filler moments (non-capture plays) ─────────────────────────────────────
+  // Each moment is its own short window; they are never chained together, so a
+  // busy game yields many usable clips rather than one unusable blob.
+  //   • returns — rated by what they stopped: a quick return on a fresh grab, or
+  //     ending a long carry that was heading for a cap, scores extra
+  //   • long carries that did not score — the near-misses
+
+  const fillerCandidates = [];
+
+  for (const r of scored.filter(e => e.type === 'return')) {
+    const c = windowAt(r,
+      Math.max(0, r.gameTime - PRE_RADIUS_MS),
+      Math.min(gameDurationMs, r.gameTime + POST_RADIUS_MS));
+    const stopped = (dropsAt.get(r.ts) ?? []).filter(d => d.team !== r.team);
+    const holdMs  = stopped.length ? Math.max(...stopped.map(d => d.holdMs)) : null;
+    if (holdMs != null && holdMs <= 3000) c.totalScore += 3;     // quick return
+    if (holdMs != null && holdMs >= 8000) c.totalScore += 4;     // stopped a long carry
+    if (r.data?.withTag) c.totalScore += 1;
+    c.focal = c.headline = { ...r, data: { ...r.data, stoppedHoldMs: holdMs } };
+    fillerCandidates.push(c);
+  }
+
+  for (const drops of dropsAt.values()) {
+    for (const d of drops) {
+      if (d.holdMs < LONG_CARRY_MS) continue;
+      const focal = { ...d.event, type: 'carry', data: { holdMs: d.holdMs, wasPopped: d.wasPopped } };
+      const c = windowAt(focal,
+        Math.max(0, focal.gameTime - Math.min(d.holdMs + 2000, 14000)),
+        Math.min(gameDurationMs, focal.gameTime + POST_RADIUS_MS));
+      c.totalScore += 6 + Math.floor(d.holdMs / 2000);
+      fillerCandidates.push(c);
+    }
+  }
+
+  // ── Merge adjacent capture windows ─────────────────────────────────────────
+  // Caps close together share one clip (the camera moves between cappers).
 
   function mergePass(list) {
     const out = [];
@@ -128,30 +159,22 @@ export function scoreHighlights({ events, playerIndex, meta, gameStartMs, actual
     return out;
   }
 
-  const mergedCaps  = mergePass(candidates.filter(c =>  c.hasCapture));
-  const mergedOther = mergePass(candidates.filter(c => !c.hasCapture));
+  const capClips = mergePass(capCandidates);
 
   // ── Selection ──────────────────────────────────────────────────────────────
-  // Every cap window is guaranteed to appear — no cap is ever skipped.
-  // Non-cap windows are added by score (descending) up to maxNonCapClips.
+  // Every cap clip is kept — no cap is ever skipped.  Filler moments are taken
+  // best-first, skipping any that overlap a cap clip or a better filler clip,
+  // up to maxNonCapClips.  The reel planner decides how many of them to use.
 
-  const capClips    = mergedCaps;
-  const nonCapClips = mergedOther
-    .filter(c => c.totalScore >= MIN_NON_CAP_SCORE)
-    .sort((a, b) => b.totalScore - a.totalScore);
-
-  const selected = [...capClips];
-  let nonCapAdded = 0;
-
-  for (const c of nonCapClips) {
-    if (nonCapAdded >= maxNonCapClips) break;
-    const overlaps = selected.some(
-      s => c.start < s.end + MERGE_GAP_MS && c.end > s.start - MERGE_GAP_MS
-    );
-    if (!overlaps) { selected.push(c); nonCapAdded++; }
+  const taken  = [...capClips];
+  const filler = [];
+  for (const c of fillerCandidates.filter(c => c.totalScore >= MIN_NON_CAP_SCORE).sort((a, b) => b.totalScore - a.totalScore)) {
+    if (filler.length >= maxNonCapClips) break;
+    const overlaps = taken.some(s => c.start < s.end + MERGE_GAP_MS && c.end > s.start - MERGE_GAP_MS);
+    if (!overlaps) { filler.push(c); taken.push(c); }
   }
 
-  selected.sort((a, b) => a.start - b.start);
+  const selected = [...capClips, ...filler].sort((a, b) => a.start - b.start);
 
   return selected.map((clip, i) => {
     const povSchedule = buildPovSchedule(clip);
@@ -209,8 +232,15 @@ function describe(event) {
   switch (event.type) {
     case 'capture':
       return `${event.playerName} caps for ${team}! (cap #${event.data?.captureNum})`;
-    case 'return':
-      return `${event.playerName} returns the flag${event.data?.withTag ? ' + tag' : ''}`;
+    case 'return': {
+      const hold = event.data?.stoppedHoldMs;
+      const how  = hold != null && hold <= 3000 ? 'quick return' : hold != null && hold >= 8000 ? 'big return' : 'return';
+      return `${event.playerName} with the ${how}${event.data?.withTag ? ' + tag' : ''}`;
+    }
+    case 'carry': {
+      const secs = Math.round((event.data?.holdMs ?? 0) / 1000);
+      return `${event.playerName} carries for ${secs}s before ${event.data?.wasPopped ? 'getting popped' : 'dropping it'}`;
+    }
     case 'grab':
       return `${event.playerName} grabs the ${event.team === 1 ? 'Blue' : 'Red'} flag`;
     case 'tag':

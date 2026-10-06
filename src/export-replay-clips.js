@@ -9,27 +9,31 @@
 //                    the series and exports them all into one reel.
 // --replay=KEY       Override the replay key (single game only; raw, not URL-encoded)
 // --caps-only        Only export clips centered on flag captures
-// --clips=N          Max non-cap filler clips per game (default: 10; all caps are kept)
-// --max-minutes=M    Cap the reel length; clips are ranked across games to fit.
-//                    Default: 8 for multi-game reels, unlimited for a single game.
+// --clips=N          Max filler (non-cap) clips considered per game (default: 30)
+// --minutes=M        Target reel length (default: 8).  Every cap is always included, even
+//                    if caps alone run past the target; other plays (quick returns, big
+//                    returns, long carries) fill the reel up to the target.
+// --chrome-profile=P Chrome profile to read the TagPro login from (default: Default).
 // --dry-run          Resolve games, score highlights, print the reel plan, then stop.
 // --restitch         Skip recording; rebuild cards/captions/reel from the clips of the last run.
 // --transition=T     cut (default: hard cuts, dip-to-black at cards) | fade | dissolve
 // --no-captions      Skip the lower-third caption burned onto each clip.
+// --logo=TEAM=FILE   With --mltp: use FILE as TEAM's logo for this run only (TEAM is an
+//                    abbreviation or part of the team name).  Repeatable.
 // --login            Open Chrome so you can log into TagPro, then extract session cookies
 //
 // Output (single game): output/clips/clip_01.mp4 ... output/game-summary.mp4
 // Output (multi game) : output/match/game_NN/... output/match-highlights.mp4
 
 import { chromium, request as playwrightRequest } from 'playwright';
-import { mkdirSync, createWriteStream, readFileSync, writeFileSync, existsSync } from 'fs';
+import { mkdirSync, createWriteStream, readFileSync, writeFileSync, existsSync, statSync, unlinkSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execFileSync, execSync } from 'child_process';
 import { get as httpsGet } from 'https';
 import { parseReplay }    from './parse-replay.js';
 import { scoreHighlights } from './score-highlights.js';
-import { fetchMatchup, describeMatchup, downloadTeamLogos } from './mltp.js';
+import { fetchMatchup, describeMatchup, downloadTeamLogos, applyLogoOverrides } from './mltp.js';
 import { makeSeriesIntroCard, makeGameTitleCard, makeSeriesFinalCard, CARD_SECONDS,
          seriesScoreAfter, seriesScoreEntering } from './series-cards.js';
 import { captionsFor, renderCaptionPng, burnCaptions } from './captions.js';
@@ -50,16 +54,29 @@ const positional = process.argv.filter(a => !a.startsWith('--'));
 const MATCH_IDS  = flags('match');
 const MLTP       = flag('mltp');
 const CAPS_ONLY  = process.argv.includes('--caps-only');
-const MAX_CLIPS  = parseInt(flag('clips') ?? positional[4] ?? '10');
-const MAX_MINUTES = flag('max-minutes') != null ? parseFloat(flag('max-minutes')) : null;
+const MAX_CLIPS  = parseInt(flag('clips') ?? positional[4] ?? '30');
+const DEFAULT_TARGET_MINUTES = 8;
+// --minutes is the target length.  --max-minutes is accepted as the old name for it.
+const TARGET_MINUTES = parseFloat(flag('minutes') ?? flag('max-minutes') ?? String(DEFAULT_TARGET_MINUTES));
+if (flag('max-minutes') != null && flag('minutes') == null)
+  console.warn('note: --max-minutes now means the target length (caps are never cut); use --minutes');
+const CHROME_PROFILE = flag('chrome-profile') ?? null;
 const DRY_RUN    = process.argv.includes('--dry-run');
 const RESTITCH   = process.argv.includes('--restitch');
 const TRANSITION = flag('transition') ?? 'cut';        // cut | fade | dissolve
 const CAPTIONS   = !process.argv.includes('--no-captions');
+// --logo=TEAM=FILE (repeatable): a one-off logo for this run; nothing is saved.
+const LOGO_OVERRIDES = process.argv.filter(a => a.startsWith('--logo=')).map(a => {
+  const [team, ...rest] = a.slice('--logo='.length).split('=');
+  const path = resolve(rest.join('='));
+  if (!team || !rest.length) throw new Error(`--logo expects TEAM=FILE (got "${a}")`);
+  if (!existsSync(path))     throw new Error(`--logo: file not found: ${path}`);
+  return { team, path };
+});
 // --debug-clip: record only clip 1, starting from t=0, so you can watch the
 // full game start and see exactly where the focal player appears/disappears.
 const DEBUG_CLIP = process.argv.includes('--debug-clip');
-if (MAX_MINUTES != null && !(MAX_MINUTES > 0)) throw new Error('--max-minutes must be a positive number');
+if (!(TARGET_MINUTES > 0)) throw new Error('--minutes must be a positive number');
 if (!['cut', 'fade', 'dissolve'].includes(TRANSITION)) throw new Error(`--transition must be cut, fade or dissolve (got "${TRANSITION}")`);
 
 const DISSOLVE_SEC  = 1.5;  // overlap per join in the fade/dissolve modes
@@ -67,8 +84,6 @@ const CARD_FADE_SEC = 0.5;  // dip-to-black at card boundaries in cut mode
 const INTRO_SEC     = 4;    // gameplay cold-open recorded at the flags-live moment
 const RECAP_SEC     = 7;    // team comparison card that closes each game
 const SCOREBOARD_SEC = 8;   // full box-score card (single-game reels only)
-const DEFAULT_MULTI_MAX_MINUTES = 8;
-const MAX_FILLER_SEC = 30;  // under a budget, non-cap clips longer than this are skipped
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -219,16 +234,13 @@ async function deriveReplayKey(meta) {
 function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const file = createWriteStream(destPath);
+    const fail = err => { file.close(); try { unlinkSync(destPath); } catch {} reject(err); };
     httpsGet(url, res => {
-      if (res.statusCode !== 200) {
-        file.close();
-        reject(new Error(`HTTP ${res.statusCode} downloading ${url}`));
-        return;
-      }
+      if (res.statusCode !== 200) { fail(new Error(`HTTP ${res.statusCode} downloading ${url}`)); return; }
       res.pipe(file);
       file.on('finish', () => { file.close(); resolve(destPath); });
-      file.on('error', reject);
-    }).on('error', reject);
+      file.on('error', fail);
+    }).on('error', fail);
   });
 }
 
@@ -242,7 +254,8 @@ function getTagproCookies() {
   console.log('  Reading TagPro cookies from Chrome profile...');
   tagproCookiesCache = [];
   try {
-    const raw    = execFileSync('python3', [resolve(__dir, 'extract_chrome_cookies.py')], { encoding: 'utf8' });
+    const args   = [resolve(__dir, 'extract_chrome_cookies.py'), ...(CHROME_PROFILE ? [CHROME_PROFILE] : [])];
+    const raw    = execFileSync('python3', args, { encoding: 'utf8' });
     const parsed = JSON.parse(raw);
     if (parsed.error) {
       console.error(`  Cookie extraction warning: ${parsed.error}`);
@@ -270,8 +283,9 @@ async function downloadFileWithSession(url, destPath) {
     if (!res.ok()) {
       const why = (await res.text().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 160);
       if (/logged in/i.test(why)) {
-        throw new Error('this replay is only served to logged-in users, and the Chrome profile the exporter reads ' +
-          'has no active TagPro login. Log into tagpro.koalabeast.com in Chrome, then rerun (or use --login)');
+        throw new Error(`this replay is only served to logged-in users, and the Chrome profile the exporter reads ` +
+          `("${CHROME_PROFILE ?? 'Default'}") has no active TagPro login. Log into tagpro.koalabeast.com in Chrome, ` +
+          `then rerun; if you use another Chrome profile, pass --chrome-profile=<name>`);
       }
       throw new Error(`HTTP ${res.status()} downloading ${url}${why ? ` — server says: "${why}"` : ''}`);
     }
@@ -305,6 +319,12 @@ async function lookupMatch(matchId) {
   const base       = 'https://tagpro.koalabeast.com/replays/gameFile';
   const urls       = [`${base}?key=${encodeURIComponent(replayKey)}`, `${base}?gameId=${game.id}`];
   const ndjsonPath = `/tmp/tagpro-match-${matchId}.ndjson`;
+  // A replay never changes once the game is over, so a copy fetched earlier is reused.
+  // That also keeps a matchup exportable after the server starts asking for a login.
+  if (existsSync(ndjsonPath) && statSync(ndjsonPath).size > 50_000) {
+    console.log(`  Using the replay fetched earlier: ${ndjsonPath}`);
+    return { ndjsonPath, replayKey };
+  }
   console.log(`  Downloading NDJSON...`);
   let lastErr;
   for (const url of urls) {
@@ -524,6 +544,12 @@ async function resolveGames() {
     console.log(`\nFetching MLTP matchup ${MLTP} ...`);
     const m = await fetchMatchup(MLTP);
     await downloadTeamLogos(m, resolve('./output/logos'));
+    const unmatched = applyLogoOverrides(m, LOGO_OVERRIDES);
+    if (unmatched.length) {
+      throw new Error(`--logo: no team matches "${unmatched[0].team}" — the teams are ` +
+        `${m.home.name} (${m.home.abbreviation}) and ${m.away.name} (${m.away.abbreviation})`);
+    }
+    for (const t of [m.home, m.away]) if (t.logoOverridden) console.log(`  Logo override for this run: ${t.name} → ${t.logoPath}`);
     console.log(`  ${describeMatchup(m)}`);
     console.log(`  ${m.home.name} (${m.home.abbreviation}) vs ${m.away.name} (${m.away.abbreviation}) — best of ${m.bestOf}`);
     const games = [];
@@ -583,7 +609,7 @@ async function prepareGame(game, multi) {
     console.log(`  Overtime detected: +${otSec}s beyond regulation`);
   }
 
-  // MAX_CLIPS controls how many non-cap filler clips to add; all caps are always kept.
+  // MAX_CLIPS caps the filler pool per game; all caps are always kept.
   let clips = scoreHighlights({ events, playerIndex, meta, gameStartMs, actualDurationMs, maxNonCapClips: MAX_CLIPS });
   if (CAPS_ONLY) clips = clips.filter(c => c.focalType === 'capture');
   if (DEBUG_CLIP) clips = clips.slice(0, 1);
@@ -603,15 +629,15 @@ async function prepareGame(game, multi) {
   return { ...game, ...parsed, mapName: game.mapName || meta?.mapName || '', clips };
 }
 
-// ── Reel planning (duration budget) ────────────────────────────────────────
-// Clips from every game compete for one time budget.  Captures always rank
-// ahead of filler; filler is ranked by score density and capped in length so a
-// single long scramble cannot eat the whole reel.  Each game is guaranteed its
-// best clip so no game disappears from the reel entirely.
+// ── Reel planning ──────────────────────────────────────────────────────────
+// Every cap is always in the reel, even when caps alone run past the target.
+// If caps leave room, the best remaining plays (quick returns, big returns,
+// long carries) fill the reel up to the target length.  A game with no caps
+// still gets its best play so it does not vanish from the reel.
 
 const clipSec = c => (c.endMs - c.startMs) / 1000;
 
-function planReel(games, { multi, budgetSec }) {
+function planReel(games, { multi, targetSec }) {
   const n = games.length;
   const cardSec = multi
     ? CARD_SECONDS.intro + CARD_SECONDS.final + n * (CARD_SECONDS.game + RECAP_SEC)
@@ -624,37 +650,34 @@ function planReel(games, { multi, budgetSec }) {
   const clipOverlap = cut ? 0 : DISSOLVE_SEC;
   let total = cardSec - cardOverlap * cardJoins;
 
-  const all = games.flatMap(g => g.clips.map(c => ({ g, c, dur: clipSec(c), isCap: c.focalType === 'capture' })));
-
-  if (budgetSec == null) {
-    total += all.reduce((s, x) => s + x.dur - clipOverlap, 0);
-    return { estimatedSec: total, kept: all.length, dropped: 0 };
-  }
-
-  const eligible = all
-    .filter(x => x.isCap || x.dur <= MAX_FILLER_SEC)
-    .sort((a, b) => (b.isCap - a.isCap)
-      || (a.isCap ? b.c.score - a.c.score : b.c.score / b.dur - a.c.score / a.dur));
+  const all  = games.flatMap(g => g.clips.map(c => ({ g, c, dur: clipSec(c), isCap: c.focalType === 'capture' })));
+  const caps = all.filter(x => x.isCap);
+  const pool = all.filter(x => !x.isCap).sort((a, b) => b.c.score - a.c.score || a.dur - b.dur);
 
   const chosen = new Set();
-  const tryAdd = x => {
-    const add = x.dur - clipOverlap;
-    if (total + add > budgetSec) return false;
-    chosen.add(x.c); total += add; return true;
-  };
-  for (const g of games) {                       // seed: best clip of each game
-    const best = eligible.find(x => x.g === g);
-    if (best) tryAdd(best);
+  const add = x => { chosen.add(x.c); total += x.dur - clipOverlap; };
+  for (const x of caps) add(x);
+
+  if (targetSec == null) {                       // --restitch: everything that was recorded
+    for (const x of pool) add(x);
+  } else {
+    for (const g of games) {                     // a game with no caps keeps its best play
+      if (!caps.some(x => x.g === g)) { const best = pool.find(x => x.g === g); if (best) add(best); }
+    }
+    for (const x of pool) {
+      if (total >= targetSec) break;
+      if (!chosen.has(x.c)) add(x);
+    }
   }
-  for (const x of eligible) if (!chosen.has(x.c)) tryAdd(x);
 
   for (const g of games) g.clips = g.clips.filter(c => chosen.has(c));   // keeps chronological order
-  return { estimatedSec: total, kept: chosen.size, dropped: all.length - chosen.size };
+  const fillerUsed = [...chosen].filter(c => c.focalType !== 'capture').length;
+  return { estimatedSec: total, caps: caps.length, fillerUsed, fillerUnused: pool.length - fillerUsed };
 }
 
 const fmtSec = s => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
 
-function printPlan(games, plan, budgetSec) {
+function printPlan(games, plan, targetSec) {
   console.log('\nReel plan');
   console.log('=========');
   for (const g of games) {
@@ -668,8 +691,13 @@ function printPlan(games, plan, budgetSec) {
         console.log(`       camera: ${c.povSchedule.map(s => `${s.player} @${(s.atMs / 1000).toFixed(1)}s`).join(' → ')}`);
     });
   }
-  const budget = budgetSec != null ? ` (budget ${fmtSec(budgetSec)}, ${plan.dropped} candidate clip(s) dropped)` : '';
-  console.log(`\nEstimated reel length: ~${fmtSec(plan.estimatedSec)}${budget}`);
+  const how = targetSec == null ? ''
+    : plan.estimatedSec >= targetSec && plan.fillerUsed === 0 && plan.caps > 0
+      ? ` (target ${fmtSec(targetSec)}; caps alone fill it)`
+      : ` (target ${fmtSec(targetSec)}; ${plan.caps} caps + ${plan.fillerUsed} other plays, ${plan.fillerUnused} unused)`;
+  console.log(`\nEstimated reel length: ~${fmtSec(plan.estimatedSec)}${how}`);
+  if (targetSec != null && plan.estimatedSec < targetSec - 1)
+    console.log(`  Short of the target: no more plays worth showing in the available games.`);
 }
 
 // ── Browser helpers ────────────────────────────────────────────────────────
@@ -867,7 +895,7 @@ for (const g of games) {
 
 // 3. Plan the reel against the duration budget.  With --restitch, reload the plan
 //    the recording run saved so the existing clip files line up with it.
-const budgetSec = MAX_MINUTES != null ? MAX_MINUTES * 60 : (multi ? DEFAULT_MULTI_MAX_MINUTES * 60 : null);
+const targetSec = TARGET_MINUTES * 60;
 if (RESTITCH) {
   for (const g of games) {
     if (!existsSync(g.planPath)) throw new Error(`--restitch: ${g.planPath} not found — record this game first`);
@@ -880,10 +908,10 @@ if (RESTITCH) {
     g.clipPaths = g.clips.map(c => `${g.clipsDir}/${c.label}.mp4`);
     g.introPath = `${g.clipsDir}/intro.mp4`;
   }
-  printPlan(games, planReel(games, { multi, budgetSec: null }), null);
+  printPlan(games, planReel(games, { multi, targetSec: null }), null);
 } else {
-  const plan = planReel(games, { multi, budgetSec });
-  printPlan(games, plan, budgetSec);
+  const plan = planReel(games, { multi, targetSec });
+  printPlan(games, plan, targetSec);
   if (DRY_RUN) { console.log('\n--dry-run: stopping before recording.'); process.exit(0); }
   for (const g of games) {
     mkdirSync(g.clipsDir, { recursive: true });

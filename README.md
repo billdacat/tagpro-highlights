@@ -13,7 +13,7 @@ The project has two independent rendering pipelines plus one experimental side t
 ## How it works (pipeline overview)
 
 1. **Parse** — `src/parse-replay.js` reads a TagPro NDJSON replay (one JSON event per line: player deltas, map state, score, game clock) and reconstructs cumulative player/game state.
-2. **Score & cluster** — `src/score-highlights.js` scores notable events (captures, returns, multi-tags, etc.) and clusters them into highlight windows: 8 s of build-up before the play, then 1 s after a capture or 2 s after anything else. Each clip also gets a camera schedule. A clip that holds several captures follows each capper in turn; any other clip follows the player who makes its headline play.
+2. **Score & cluster** — `src/score-highlights.js` builds a clip window around every capture (8 s of build-up, 1 s after the score; captures close together share one clip) and around every other notable play: returns, rated by what they stopped (a quick return on a fresh grab, or ending a long carry), and long carries that never scored. Each clip gets a camera schedule: a clip with several captures follows each capper in turn; any other clip follows the player who made the play.
 3. **Export a manifest** — `src/export-manifest.js` writes `highlight-manifest.json` describing each clip (start/end time, players involved, description).
 4. **Render** — either:
    - `src/export-replay-clips.js` replays the game inside the real TagPro client (via an authenticated session) and screen-records each clip with `MediaRecorder`, or
@@ -72,14 +72,16 @@ node src/export-replay-clips.js [ndjsonPath] [flags]
 |---|---|
 | `[ndjsonPath]` (positional) | Path to a local NDJSON replay file. Ignored if `--match` is set. Defaults to a sample path under `~/Downloads` if omitted. |
 | `--match=<id>[,<id>…]` | One or more `tagpro.eu` match IDs (comma-separated, or repeat the flag). Each is looked up on `tagpro.eu`, resolved to its replay on `tagpro.koalabeast.com`, and the NDJSON downloaded automatically. More than one ID produces a multi-game series reel. |
-| `--mltp=<id or URL>` | An mltp.gg matchup ID or URL, e.g. `https://www.mltp.gg/matchup/<uuid>?tier=majors` (copy it from the [schedule](https://www.mltp.gg/schedule?tier=majors)). Pulls the tagpro.eu match ID of every game in the series and exports them all into one reel, in game order. |
-| `--max-minutes=<m>` | Cap the reel length. Clips from every game are ranked against this budget: captures first (by score), then filler clips of 30 s or less (by score density); each game keeps at least its best clip. Default: `8` for multi-game reels, unlimited for a single game. |
+| `--mltp=<id or URL>` | An mltp.gg matchup ID or URL, e.g. `https://www.mltp.gg/matchup/<uuid>?tier=majors` (copy it from the [schedule](https://www.mltp.gg/schedule?tier=majors)). Pulls the tagpro.eu match ID of every game in the series and exports them all into one reel, in game order. A game whose replay cannot be fetched is skipped with a warning, and the reel is correspondingly shorter. |
+| `--minutes=<m>` | Target reel length (default: `8`). Every capture is always included, even when captures alone run past the target. If they leave room, the best other plays (quick returns, big returns, long carries that didn't score) fill the reel up to the target. `--max-minutes` is accepted as the old name. |
+| `--chrome-profile=<name>` | Chrome profile to read the TagPro login from, e.g. `Profile 1`. Default: `Default`. Only matters for replays the server will not hand out without a login. |
 | `--dry-run` | Resolve the games, score the highlights, print the reel plan and estimated length, then stop before opening the browser. Handy for checking what a series reel will contain. |
 | `--restitch` | Skip recording. Reloads the `plan.json` each run saves next to its clips and rebuilds captions, cards, and the reel from the existing clip files. Use it to iterate on the look without another real-time recording pass. |
 | `--transition=<t>` | How clips are joined. `cut` (default): hard cuts between plays, a 0.5 s dip to black wherever a card meets anything. `fade`: 1.5 s crossfade between everything. `dissolve`: the same with ffmpeg's noisy pixel dissolve. In the blend modes each clip starts on the previous clip's focal player and switches POV mid-blend to hide the camera jump. |
 | `--no-captions` | Skip the lower-third caption (event type, player, team) burned onto the opening seconds of each clip. |
+| `--logo=<team>=<file>` | With `--mltp`: use `<file>` as that team's logo for this run only. `<team>` is an abbreviation or part of the team name. Repeatable. Nothing is saved, so the next run goes back to the team's real logo. |
 | `--replay=<key>` | Explicitly overrides the replay key used to build the `tagpro.koalabeast.com/game?replay=...` URL, instead of deriving it automatically or from `--match`. Single-game only. |
-| `--clips=<n>` | Max number of non-capture "filler" highlight clips to consider per game (default: `10`). Flag captures are always kept (subject to `--max-minutes`). |
+| `--clips=<n>` | Max number of non-capture plays to consider per game (default: `30`). Captures are always kept. |
 | `--caps-only` | Only export clips centered on flag captures. |
 | `--debug-clip` | Record only the first clip, starting at t=0 — useful for debugging POV/timing issues without rendering the whole set. |
 | `--login` | Opens Chrome to `tagpro.koalabeast.com/login` so you can sign in, then waits for Enter before continuing. Use this the first time, or whenever your session has expired. |

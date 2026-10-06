@@ -14,7 +14,7 @@ export const CAPTION = {
   delaySec: 0.2, fadeInSec: 0.25, holdSec: 3.4, fadeOutSec: 0.4,
 };
 
-const EVENT_LABEL = { capture: 'Capture', return: 'Return', tag: 'Tag', grab: 'Grab', drop: 'Drop' };
+const EVENT_LABEL = { capture: 'Capture', return: 'Return', tag: 'Tag', grab: 'Grab', drop: 'Drop', carry: 'Carry' };
 
 // Build the captions for a clip: one per camera stop, shown when the camera gets there.
 // A clip with two captures therefore names each capper in turn.  Team words in the
