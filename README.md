@@ -58,7 +58,7 @@ You need a TagPro replay in NDJSON format (one JSON array per line: `[timestampM
 
 Note that replays only stay on `tagpro.koalabeast.com` for a limited time; a game whose replay has expired is skipped with a warning when exporting a series.
 
-Replay files are requested the same way TagPro's own replay viewer requests them (`/replays/gameFile?key=<replay key>`), which needs no login. If the server refuses that, the exporter retries with the TagPro session from your Chrome `Default` profile; if that profile has no active TagPro login the game is skipped, and the fix is to log into tagpro.koalabeast.com in Chrome and rerun (or use `--login`).
+Replay files are requested the same way TagPro's own replay viewer requests them (`/replays/gameFile?key=<replay key>`). Which replays the server hands out without a login varies from game to game and changes over time, so when a request is refused the exporter retries with your TagPro login from Chrome (see [Authentication](#authentication--the---login-flow)). If no Chrome profile is logged into TagPro the game is skipped, and the fix is to log into tagpro.koalabeast.com in Chrome and rerun. A replay that has been fetched once is kept and reused.
 
 ## Usage
 
@@ -74,7 +74,7 @@ node src/export-replay-clips.js [ndjsonPath] [flags]
 | `--match=<id>[,<id>…]` | One or more `tagpro.eu` match IDs (comma-separated, or repeat the flag). Each is looked up on `tagpro.eu`, resolved to its replay on `tagpro.koalabeast.com`, and the NDJSON downloaded automatically. More than one ID produces a multi-game series reel. |
 | `--mltp=<id or URL>` | An mltp.gg matchup ID or URL, e.g. `https://www.mltp.gg/matchup/<uuid>?tier=majors` (copy it from the [schedule](https://www.mltp.gg/schedule?tier=majors)). Pulls the tagpro.eu match ID of every game in the series and exports them all into one reel, in game order. A game whose replay cannot be fetched is skipped with a warning, and the reel is correspondingly shorter. |
 | `--minutes=<m>` | Target reel length (default: `8`). Every capture is always included, even when captures alone run past the target. If they leave room, the best other plays (quick returns, big returns, long carries that didn't score) fill the reel up to the target. `--max-minutes` is accepted as the old name. |
-| `--chrome-profile=<name>` | Chrome profile to read the TagPro login from, e.g. `Profile 1`. Default: `Default`. Only matters for replays the server will not hand out without a login. |
+| `--chrome-profile=<name>` | Pin the Chrome profile to read the TagPro login from, e.g. `Profile 4`. By default every profile is checked and the one with a live TagPro session is used. |
 | `--dry-run` | Resolve the games, score the highlights, print the reel plan and estimated length, then stop before opening the browser. Handy for checking what a series reel will contain. |
 | `--restitch` | Skip recording. Reloads the `plan.json` each run saves next to its clips and rebuilds captions, cards, and the reel from the existing clip files. Use it to iterate on the look without another real-time recording pass. |
 | `--transition=<t>` | How clips are joined. `cut` (default): hard cuts between plays, a 0.5 s dip to black wherever a card meets anything. `fade`: 1.5 s crossfade between everything. `dissolve`: the same with ffmpeg's noisy pixel dissolve. In the blend modes each clip starts on the previous clip's focal player and switches POV mid-blend to hide the camera jump. |
@@ -130,7 +130,7 @@ When a clip contains two captures by different players, the camera stays on the 
 
 #### Authentication / the `--login` flow
 
-`export-replay-clips.js` needs to load a replay on the real `tagpro.koalabeast.com` client, which requires being logged in. Rather than juggling a separate Playwright-managed login, it reads your **existing** Chrome session cookie for `tagpro.koalabeast.com` straight out of Chrome's local, on-disk cookie database and injects it into Playwright's browser context.
+`export-replay-clips.js` needs to load a replay on the real `tagpro.koalabeast.com` client, and the server hands some replays only to logged-in users. Rather than juggling a separate Playwright-managed login, it reads your **existing** TagPro login straight out of Chrome's local, on-disk cookie database and injects it into Playwright's browser context. TagPro's session cookie lives on the parent domain `.koalabeast.com` (so it also covers the game servers), so the whole domain's cookies are read. Without `--chrome-profile`, every Chrome profile is checked and the one holding a live TagPro session is used; the run log says which.
 
 - Cookie decryption uses your macOS Keychain entry for "Chrome Safe Storage" (via the `security` CLI) plus `openssl`, exactly the way Chrome itself does it — nothing leaves your machine.
 - Run with `--login` the first time (or after your session expires) to open a real Chrome window, sign in normally, and press Enter to continue.

@@ -244,50 +244,52 @@ function downloadFile(url, destPath) {
   });
 }
 
-// TagPro session cookies, read once from Chrome's profile (see extract_chrome_cookies.py).
+// TagPro's login, read once from Chrome's cookie store (see extract_chrome_cookies.py).
 // Instead of trying to launch Chrome with a debug port (blocked by macOS's singleton
 // mechanism), we read the cookies from Chrome's profile database and hand them to
-// Playwright.
-let tagproCookiesCache = null;
-function getTagproCookies() {
-  if (tagproCookiesCache) return tagproCookiesCache;
-  console.log('  Reading TagPro cookies from Chrome profile...');
-  tagproCookiesCache = [];
+// Playwright.  Without --chrome-profile the extractor picks the profile that holds a
+// live TagPro session.
+let tagproSession = null;   // { cookies, loggedIn, profile, profileName }
+function getTagproSession() {
+  if (tagproSession) return tagproSession;
+  console.log('  Reading the TagPro login from Chrome...');
+  tagproSession = { cookies: [], loggedIn: false, profile: CHROME_PROFILE ?? '?', profileName: '' };
   try {
     const args   = [resolve(__dir, 'extract_chrome_cookies.py'), ...(CHROME_PROFILE ? [CHROME_PROFILE] : [])];
-    const raw    = execFileSync('python3', args, { encoding: 'utf8' });
-    const parsed = JSON.parse(raw);
+    const parsed = JSON.parse(execFileSync('python3', args, { encoding: 'utf8' }));
     if (parsed.error) {
       console.error(`  Cookie extraction warning: ${parsed.error}`);
     } else {
-      tagproCookiesCache = parsed.cookies;
-      console.log(`  Found ${tagproCookiesCache.length} cookie(s) for tagpro.koalabeast.com`);
+      tagproSession = parsed;
+      const who = `Chrome profile "${parsed.profileName || parsed.profile}" (${parsed.profile})`;
+      console.log(parsed.loggedIn
+        ? `  Logged into TagPro via ${who}`
+        : `  No TagPro login found in ${who}: ${parsed.cookies.length} koalabeast.com cookie(s), none a session`);
     }
   } catch (err) {
     console.error(`  Cookie extractor failed: ${err.message}`);
   }
-  return tagproCookiesCache;
+  return tagproSession;
 }
+const getTagproCookies = () => getTagproSession().cookies;
 
 // Some replay files are only served to logged-in users.  Fetch with the same TagPro
 // session the recording browser uses.  Redirects are not followed, so the session
 // cookie is only ever sent to the host in `url`.
 async function downloadFileWithSession(url, destPath) {
-  const cookies = getTagproCookies();
-  if (!cookies.length) throw new Error('this replay needs a TagPro login and no session cookies were found — run with --login');
-  const api = await playwrightRequest.newContext({
-    extraHTTPHeaders: { Cookie: cookies.map(c => `${c.name}=${c.value}`).join('; ') },
-  });
+  const session = getTagproSession();
+  if (!session.loggedIn) {
+    throw new Error('this replay is only served to logged-in users, and no Chrome profile has a live TagPro ' +
+      `login${CHROME_PROFILE ? ` (looked in "${CHROME_PROFILE}")` : ''}. Log into tagpro.koalabeast.com in Chrome, then rerun`);
+  }
+  // Playwright matches cookies to the request host itself, so the parent-domain
+  // session cookie goes only to koalabeast.com hosts.
+  const api = await playwrightRequest.newContext({ storageState: { cookies: session.cookies, origins: [] } });
   try {
     const res = await api.get(url, { maxRedirects: 0 });
     if (!res.ok()) {
       const why = (await res.text().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 160);
-      if (/logged in/i.test(why)) {
-        throw new Error(`this replay is only served to logged-in users, and the Chrome profile the exporter reads ` +
-          `("${CHROME_PROFILE ?? 'Default'}") has no active TagPro login. Log into tagpro.koalabeast.com in Chrome, ` +
-          `then rerun; if you use another Chrome profile, pass --chrome-profile=<name>`);
-      }
-      throw new Error(`HTTP ${res.status()} downloading ${url}${why ? ` — server says: "${why}"` : ''}`);
+      throw new Error(`HTTP ${res.status()} downloading ${url} even with your TagPro login${why ? ` — server says: "${why}"` : ''}`);
     }
     writeFileSync(destPath, await res.body());
   } finally {
@@ -498,8 +500,10 @@ window.__tpRecord = (sliderMs, durationMs, targetW, targetH, bitrateMbps, pov) =
           const pinned = t >= barMax;
           if (pinned && pinnedAt == null) pinnedAt = performance.now();
           const done    = t >= planEnd || (pinned && performance.now() - pinnedAt >= planEnd - barMax);
-          // A replay that stops advancing mid-way has stalled; the wall-clock limit is a last resort.
-          const stalled = !pinned && performance.now() - lastAdvance > 400;
+          // A replay whose clock stops for a while has ended early; a brief playback
+          // hitch must not count, so wait well past any stutter.  The wall-clock
+          // limit remains the last resort.
+          const stalled = !pinned && performance.now() - lastAdvance > 2500;
           if (done || stalled || performance.now() - recStart > durationMs + 3000) {
             log('stopping at ' + t + 'ms' + (done ? (pinned ? ' (end of replay)' : '') : stalled ? ' (replay stalled)' : ' (wall-clock limit)'));
             mr.stop();
@@ -925,9 +929,11 @@ if (RESTITCH) {
 if (multi) mkdirSync(`${MATCH_DIR}/cards`, { recursive: true });
 
 if (!RESTITCH) {
-  // 4. Auth: the TagPro session cookies from Chrome, injected into Playwright's Chromium.
+  // 4. Auth: the TagPro login from Chrome, injected into Playwright's Chromium.
   console.log('');
   const tagproCookies = getTagproCookies();
+  if (!getTagproSession().loggedIn)
+    console.warn('  (not logged into TagPro: replays the server gates behind a login will not open)');
 
   // Launch Playwright's own Chromium (no system Chrome needed)
   console.log('Launching browser...');
